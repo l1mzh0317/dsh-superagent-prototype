@@ -36,7 +36,10 @@ function ticketChannels(ticket: Ticket, workspace: string): string[] {
 export function publicEvent(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object') return
   const event = value as { type?: string; seq?: number; time?: number; data?: unknown }
-  const data = event.data as { content?: unknown[]; message?: { content?: unknown[] }; source?: { kind?: string } } | undefined
+  const data = event.data as { content?: unknown[]; message?: { content?: unknown[] }; source?: { kind?: string }; name?: string; reason?: string } | undefined
+  if (event.type === 'tool/call') return { seq: event.seq, time: event.time, role: 'activity', phase: 'tool', text: `正在调用工具 · ${(data?.name ?? '工具').replace(/[^\w.:-]/g, '').slice(0, 80)}` }
+  if (event.type === 'turn/start' || event.type === 'assistant/attempt') return { seq: event.seq, time: event.time, role: 'activity', phase: 'analysis', text: 'Worker 正在分析任务' }
+  if (event.type === 'turn/end') return { seq: event.seq, time: event.time, role: 'activity', phase: 'idle', text: data?.reason === 'cancelled' ? '当前轮已中断' : '本轮处理已结束，等待后续消息' }
   if (event.type === 'user/message' || event.type === 'assistant/message') {
     const content = event.type === 'assistant/message' ? data?.message?.content : data?.content
     const text = content?.flatMap(b => { const block = b as { type?: string; text?: string }; return block.type === 'text' && typeof block.text === 'string' ? [block.text] : [] }).join('\n') ?? ''
@@ -69,6 +72,7 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
     state: ticketStage(ticket), ended: ticket.ended, report: ticket.assignments.at(-1)?.report,
     sessionId: ticket.assignments.some(a => a.startedAt) ? workerSessionId(ticket.id) : null,
     sessionStatus: ctx.agents.get(workerSessionId(ticket.id) as SessionId)?.status ?? 'idle',
+    sessionName: ticket.title, sessionUrl: huly.dashboardUrl(ticket.id),
     canWrite: canWrite && ticket.ended?.by !== 'human', channels: ticketChannels(ticket, d.workspace),
     sourceUrl: ticket.channels.find(c => c.source === 'huly') ? huly.threadUrl(ticket.channels[0]!.address.channelId!, ticket.channels[0]!.address.rootId!) : null })
   return ctx.webServer.register({ kind: 'prefix', path: '/team-peppy', handler: async (req, res) => {
@@ -101,21 +105,29 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
       if (!shown.sessionId) throw new HulyError(409, 'Worker session 尚未初始化')
       if (match![2] === 'session' && req.method === 'GET') {
         const stop = new AbortController(); const closed = () => stop.abort(); res.on('close', closed)
-        const heartbeat = setInterval(() => { void huly.account(token).then(() => mayRead(ticket, token)).then(ok => {
-          if (!ok) stop.abort(); else if (!res.destroyed) res.write(': heartbeat\n\n')
+        const heartbeat = setInterval(() => { void huly.account(token).then(() => { const current = runtime.store.tickets.get(ticket.id); return current ? mayRead(current, token) : false }).then(ok => {
+          if (!ok) stop.abort(); else if (!res.destroyed) {
+            const current = runtime.store.tickets.get(ticket.id)
+            res.write(`data: ${JSON.stringify({ type: 'status', status: ctx.agents.get(shown.sessionId as SessionId)?.status ?? 'idle', state: current ? ticketStage(current) : { stage: 'ended' } })}\n\n`)
+          }
         }).catch(() => stop.abort()) }, 10_000)
         heartbeat.unref()
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' })
         const send = (frame: unknown) => { if (!res.destroyed) res.write(`data: ${JSON.stringify(frame)}\n\n`) }
+        let announcedActivity = ''
         try {
           for await (const frame of ctx.sessionController.follow({ address: { kind: 'session', sessionId: shown.sessionId as SessionId }, assistantStream: true, maxMessages: 100 }, stop.signal)) {
             if (frame.type === 'snapshot') {
               send({ type: 'snapshot', sessionId: shown.sessionId, cursor: frame.cursor, records: frame.records.flatMap(r => { const e = publicEvent(r.event); return e ? [e] : [] }), streaming: publicStreamText(frame.assistantStream?.activeAttempt?.stream), status: shown.sessionStatus })
-            } else if (frame.type === 'event') { const event = publicEvent(frame.event); send({ type: 'event', cursor: frame.event.seq, ...(event ? { event } : {}) }) }
+            } else if (frame.type === 'event') { const event = publicEvent(frame.event); if (event?.role === 'activity') announcedActivity = String(event.phase); send({ type: 'event', cursor: frame.event.seq, ...(event ? { event } : {}) }) }
             else if (frame.type === 'assistant-stream') {
               const f = frame.frame
-              if (f.type === 'chunk') { const c = f.chunk as { type?: string; text?: string }; if (c.type === 'text-delta' && c.text) send({ type: 'delta', text: c.text }) }
-              if (f.type === 'start' || f.type === 'end') send({ type: 'stream', state: f.type })
+              if (f.type === 'chunk') {
+                const c = f.chunk as { type?: string; text?: string }
+                if (c.type === 'text-delta' && c.text) send({ type: 'delta', text: c.text })
+                if (c.type === 'reasoning-delta' && announcedActivity !== 'analysis') { announcedActivity = 'analysis'; send({ type: 'activity', phase: 'analysis', text: 'Worker 正在分析任务' }) }
+              }
+              if (f.type === 'start' || f.type === 'end') { announcedActivity = ''; send({ type: 'stream', state: f.type }) }
             }
           }
         } finally { clearInterval(heartbeat); stop.abort(); res.off('close', closed); res.end() }

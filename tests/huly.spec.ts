@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { HulyClient, HULY, readMarkup, textMarkup, type HulyDeployment, type HulyDoc } from '../src/sources/huly-client.ts'
-import { hulyTrigger, pollHuly } from '../src/sources/huly.ts'
+import { hulyTrigger, hulyKind, pollHuly } from '../src/sources/huly.ts'
 import { publicEvent, requestToken } from '../src/team-peppy/http.ts'
 import type { SourceContext } from '../src/sources/host.ts'
 
@@ -25,8 +25,17 @@ describe('Huly Source', () => {
     expect(readMarkup(mention.replace(HULY.person, 'tracker:class:Issue')).mentions).toEqual([])
     const edited = hulyTrigger(message({ editedOn: 2000, modifiedOn: 2000 }), d, 'channel')!
     expect(edited.addressed).toBeUndefined()
+    expect(edited.human).toBe(false)
     expect(edited.id).not.toBe(hulyTrigger(message(), d, 'channel')!.id)
     expect(hulyTrigger(message({ modifiedOn: 3000 }), d, 'channel')!.id).toBe(hulyTrigger(message(), d, 'channel')!.id)
+  })
+  it('observes only an explicitly invited thread, rather than its entire channel', () => {
+    const source = hulyKind({ deployment: d } as HulyClient), trigger = hulyTrigger(message(), d, 'channel')!
+    const config = { workspace: d.workspace, channels: d.channels, pollMs: 2000 }
+    expect(source.scope!(trigger, config)).toMatchObject({ listened: true, observed: false })
+    trigger.meta.observedThread = true
+    expect(source.scope!(trigger, config)).toMatchObject({ listened: true, observed: true })
+    expect(source.scope!(trigger, { ...config, channels: [] })).toMatchObject({ listened: false })
   })
   it('retains the read cursor when ingestion fails, allowing replay', async () => {
     const state = new Map<string, unknown>(), receive = vi.fn().mockRejectedValueOnce(new Error('interrupted')).mockResolvedValue({ stored: true })
@@ -51,6 +60,23 @@ describe('Huly Source', () => {
     await pollHuly(host, client, config); expect(find).not.toHaveBeenCalled()
     await pollHuly(host, client, config); expect(receive).toHaveBeenCalledOnce()
   })
+  it('continues observing an invited thread even when its discussion created no worker ticket', async () => {
+    const state = new Map<string, unknown>(), receive = vi.fn().mockReturnValue('stored')
+    const host = { state: { get: (k: string) => state.get(k), set: (k: string, v: unknown) => state.set(k, v) }, receive, threads: { get: () => undefined } } as unknown as SourceContext
+    let batch = [message({ modifiedOn: 5000 })]
+    const client = { deployment: d, find: vi.fn().mockImplementation((_, q) => typeof q.modifiedOn === 'number' ? [] : batch) } as unknown as HulyClient
+    state.set('huly:cursor:workspace-a', { time: 4000, id: '' })
+    const config = { workspace: d.workspace, channels: d.channels, pollMs: 2000 }
+    await pollHuly(host, client, config)
+    batch = [message({ _id: 'reply', _class: HULY.reply, attachedTo: 'root', message: textMarkup('接着讨论'), modifiedOn: 6000 })]
+    await pollHuly(host, client, config)
+    expect(receive).toHaveBeenCalledTimes(2)
+    expect(receive.mock.calls[1]?.[0]).toMatchObject({ meta: { observedThread: true, rootId: 'root' } })
+    expect(receive.mock.calls[1]?.[0].addressed).toBeUndefined()
+    batch = [message({ _id: 'unrelated', message: textMarkup('其他频道话题'), modifiedOn: 7000 })]
+    await pollHuly(host, client, config)
+    expect(receive).toHaveBeenCalledTimes(2)
+  })
   it('reconciles a successful reply after a lost HTTP receipt instead of creating another message', async () => {
     const client = new HulyClient(d)
     vi.spyOn(client, 'one').mockResolvedValue(message({ _id: 'existing' }))
@@ -68,5 +94,8 @@ describe('Team Peppy presentation boundaries', () => {
     expect(publicEvent({ type: 'system/message', seq: 1, data: { content: [{ type: 'text', text: 'secret' }] } })).toBeUndefined()
     expect(publicEvent({ type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'reasoning', text: 'private' }, { type: 'text', text: 'public' }] } } })).toMatchObject({ role: 'assistant', text: 'public' })
     expect(publicEvent({ type: 'tool/result', seq: 3, data: { content: [{ type: 'text', text: 'credential' }] } })).not.toHaveProperty('text', 'credential')
+    expect(publicEvent({ type: 'tool/call', seq: 4, data: { name: 'bash', arguments: 'private credential' } })).toMatchObject({ role: 'activity', text: '正在调用工具 · bash' })
+    expect(JSON.stringify(publicEvent({ type: 'tool/call', seq: 4, data: { name: 'bash', arguments: 'private credential' } }))).not.toContain('credential')
+    expect(publicEvent({ type: 'assistant/attempt', seq: 5, data: { reasoning: 'private' } })).toMatchObject({ phase: 'analysis', text: 'Worker 正在分析任务' })
   })
 })

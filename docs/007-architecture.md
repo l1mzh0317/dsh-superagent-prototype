@@ -370,6 +370,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/huly.ts` | Huly Source registration, message normalization and durable polling cursor |
 | `src/sources/huly-client.ts` | Huly REST transport, typed mentions and idempotent thread replies |
+| `src/sources/huly-feedback.ts` | Durable received reactions, editable channel receipts and worker-session links derived from native task state |
 | `src/team-peppy/http.ts` | Huly-authenticated task views and original worker Session read, input and cancellation |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
@@ -412,6 +413,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/huly.spec.ts` | Huly mention normalization, cursor recovery, reply reconciliation and presentation boundaries |
+| `tests/huly-feedback.spec.ts` | Channel receipt retry, received reactions, real worker links and bot-owned status updates |
+| `tests/huly-ui.spec.ts` | Reply deep links, queued session allocation and progress visibility in the real dashboard script |
 | `tests/huly-http.spec.ts` | Worker Session binding, authenticated inputs, channel access and CSRF |
 | `tests/huly-mode.spec.ts` | Huly-only startup without a fabricated GitHub identity or credential helper |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |

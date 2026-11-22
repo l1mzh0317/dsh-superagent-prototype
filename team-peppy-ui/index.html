@@ -12,6 +12,7 @@
     <section id="detail" class="detail" aria-label="任务详情"><div class="welcome"><span class="eyebrow">团队协作</span><h2>从任务进入工作现场</h2><p>选择任务，查看当前状态，或打开原有的 worker session 继续工作。</p></div></section>
     <aside id="session-panel" class="session" hidden aria-labelledby="session-title">
       <div class="session-header"><div><h2 id="session-title">Worker session</h2><span id="session-state" class="muted"></span></div><div class="session-actions"><button id="expand" class="icon-button" aria-label="展开会话">⤢</button><button id="close-session" class="icon-button" aria-label="收起会话">×</button></div></div>
+      <div id="session-activity" class="session-activity" role="status" aria-live="polite">正在连接 worker…</div>
       <div id="messages" class="messages" tabindex="0" aria-label="Worker 会话内容"></div>
       <div id="session-feedback" role="status" aria-live="polite"></div>
       <form id="composer"><label for="prompt" class="sr-only">向当前 worker 发送指令</label><textarea id="prompt" placeholder="补充信息，或直接告诉 Peppy 下一步怎么做…" rows="3"></textarea><div class="composer-footer"><span id="input-hint">连接原有会话</span><button id="cancel-turn" type="button" class="subtle">中断当前轮</button><button id="send" type="submit" class="primary">发送 ↑</button></div></form>
