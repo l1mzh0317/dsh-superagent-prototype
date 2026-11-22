@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Team Peppy</title><link rel="stylesheet" href="./app.css"><script src="./app.js" type="module"></script></head>
+<body>
+  <header class="topbar"><a href="/workbench/pt/chunter" id="workspace-link" class="back">← 返回频道</a><span class="brand">Team Peppy</span><span id="connection" role="status">正在连接工作区…</span><button id="refresh" class="icon-button" aria-label="刷新任务">↻</button></header>
+  <main id="layout">
+    <section class="tasks" aria-labelledby="tasks-heading"><div class="section-title"><h1 id="tasks-heading">任务</h1><span id="count" class="muted"></span></div>
+      <label class="search"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索任务" aria-label="搜索任务"></label>
+      <nav id="filters" aria-label="筛选任务"><button data-filter="all" aria-pressed="true">全部</button><button data-filter="working" aria-pressed="false">进行中</button><button data-filter="person" aria-pressed="false">待处理</button><button data-filter="ended" aria-pressed="false">已结束</button></nav>
+      <div id="task-list" aria-live="polite"><p class="empty">正在读取 DSH 任务…</p></div>
+    </section>
+    <section id="detail" class="detail" aria-label="任务详情"><div class="welcome"><span class="eyebrow">团队协作</span><h2>从任务进入工作现场</h2><p>选择任务，查看当前状态，或打开原有的 worker session 继续工作。</p></div></section>
+    <aside id="session-panel" class="session" hidden aria-labelledby="session-title">
+      <div class="session-header"><div><h2 id="session-title">Worker session</h2><span id="session-state" class="muted"></span></div><div class="session-actions"><button id="expand" class="icon-button" aria-label="展开会话">⤢</button><button id="close-session" class="icon-button" aria-label="收起会话">×</button></div></div>
+      <div id="messages" class="messages" tabindex="0" aria-label="Worker 会话内容"></div>
+      <div id="session-feedback" role="status" aria-live="polite"></div>
+      <form id="composer"><label for="prompt" class="sr-only">向当前 worker 发送指令</label><textarea id="prompt" placeholder="补充信息，或直接告诉 Peppy 下一步怎么做…" rows="3"></textarea><div class="composer-footer"><span id="input-hint">连接原有会话</span><button id="cancel-turn" type="button" class="subtle">中断当前轮</button><button id="send" type="submit" class="primary">发送 ↑</button></div></form>
+    </aside>
+  </main>
+</body></html>

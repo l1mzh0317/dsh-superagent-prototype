@@ -17,7 +17,8 @@
     "./github-watch": "./lib/github-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./locale/*.json": "./locale/*.json",
+    "./huly-watch": "./lib/huly-watch.js"
   },
   "files": [
     "lib",
@@ -25,7 +26,8 @@
     "locale/*.json",
     "README.md",
     "prompts",
-    "skills"
+    "skills",
+    "team-peppy-ui"
   ],
   "dsh": {
     "bundle": {
