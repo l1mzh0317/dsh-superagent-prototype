@@ -43,8 +43,8 @@ export class Tickets extends EnginePart {
     let ticket: Ticket = { id, title: outcome.title, decisionId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
       createdAt: at, updatedAt: at, origin }
     for (const triggerId of triggerIds) {
-      const channel = this.repo.triggers.get(triggerId)?.channel
-      if (channel && !ticket.channels.some(item => sameChannel(item, channel))) ticket.channels.push(channel)
+      const trigger = this.repo.triggers.get(triggerId)
+      if (trigger) this.rememberContextChannel(ticket, trigger.channel, trigger.contextChannel)
     }
     ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket
     const assignment = this.newAssignment(ticket)
@@ -229,12 +229,20 @@ export class Tickets extends EnginePart {
     for (const id of tickets) this.emit('thread.unsubscribed', { threadKey: current.key, ticketId: id, by, ...(reason ? { reason } : {}) })
     return true
   }
+  private rememberContextChannel(ticket: Ticket, ...channels: Array<ChannelRef | undefined>): void {
+    for (const channel of channels) if (channel && !ticket.channels.some(item => sameChannel(item, channel))) ticket.channels.push(channel)
+  }
+
   /**
    * Add an Input once (idempotently) and ask the Executor to deliver it, or to launch again a pending Assignment whose launch
    * failed once no person is waited for: a Policy change alone does not launch it again.
    */
   addInput(ticket: Ticket, input: TicketInput): void {
     if (ticket.inputs.some(existing => existing.id === input.id)) return
+    if (input.kind === 'trigger') {
+      const trigger = this.repo.triggers.get(input.triggerId)
+      if (trigger?.contextChannel) this.rememberContextChannel(ticket, trigger.channel, trigger.contextChannel)
+    }
     ticket.inputs.push(input); ticket.updatedAt = this.now()
     // Hold back automated inputs while the worker is waiting on a person.
     const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)

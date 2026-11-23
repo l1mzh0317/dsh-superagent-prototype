@@ -63,6 +63,8 @@ export async function candidateCard(host: LinkHost, candidate: Candidate) {
   // Format the primary trigger like a worker input (including the message it replies to) and summarize earlier batch triggers as cards.
   const others = candidate.triggers.filter(trigger => trigger.id !== primary.id)
   return { ...triggerMessage(primary, await sourceLink(host, primary), undefined, repliedTo(host, primary)), strength: candidate.strength,
+    ...(primary.contextChannel && primary.meta.discussionUrl ? { discussion_url: primary.meta.discussionUrl } : {}),
+    ...(primary.routeToRouter ? { routing_preference: 'Use the selected discussion. Reply in the original message thread. Create or attach work only when the user requests it.' } : {}),
     mode: settings.eval.mode, ...others.length ? { batch: others.map(trigger => triggerCard(trigger)) } : {},
     ...handedBack.length ? { handed_back: handedBack } : {}, ...relatedTickets(candidate.tickets),
     ...(delivered.length ? { delivered_to: delivered } : {}), ...(referenced.length ? { referenced_tickets: referenced.map(ticketCard) } : {}),

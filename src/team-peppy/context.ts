@@ -10,7 +10,14 @@ export function threadMessages(runtime: Pick<Runtime, 'store'>, workspace: strin
 }
 export async function contextView(runtime: Runtime, client: HulyClient, token: string, ticket?: Ticket, conversation?: Trigger) {
   const workspace = client.deployment.workspace, inputs = new Map<string, Trigger>(), sources = new Map<string, { channelId: string; rootId: string }>()
-  if (conversation) sources.set(`${conversation.meta.channelId}:${conversation.meta.rootId}`, { channelId: String(conversation.meta.channelId), rootId: String(conversation.meta.rootId) })
+  if (conversation) {
+    const logical = typeof conversation.meta.discussionId === 'string' ? runtime.store.triggers.get(conversation.meta.discussionId) : undefined
+    for (const input of [conversation, logical, ...runtime.store.read.hulyDiscussionMessages(workspace, logical?.id ?? conversation.id)]) {
+      if (!input || input.meta.workspace !== workspace || !input.channel) continue
+      const { channelId, rootId } = input.channel.address
+      if (channelId && rootId) sources.set(`${channelId}:${rootId}`, { channelId, rootId })
+    }
+  }
   for (const channel of ticket?.channels ?? []) if (channel.source === 'huly' && channel.address.workspace === workspace) sources.set(`${channel.address.channelId}:${channel.address.rootId}`, { channelId: channel.address.channelId!, rootId: channel.address.rootId! })
   for (const id of [...(ticket?.origin.triggerIds ?? []), ...(ticket?.inputs.flatMap(i => i.kind === 'trigger' ? [i.triggerId] : []) ?? [])]) {
     const t = runtime.store.triggers.get(id)

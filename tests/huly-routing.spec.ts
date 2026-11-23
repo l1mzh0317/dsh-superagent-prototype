@@ -43,6 +43,20 @@ describe('Optional Huly mention routing', () => {
     f.input.actor.id = 'another-member'; await f.routing.receive(f.input)
     expect(f.receive.mock.calls.at(-1)?.[0]).toMatchObject({ meta: { routingError: true } })
   })
+  it('puts a discussion-only selection in the original Router thread without attaching or requiring a worker', async () => {
+    const f = fixture()
+    const channel = { source: 'huly', thread: 'ws:c:discussion', address: { workspace: 'ws', channelId: 'c', rootId: 'discussion' } }
+    const topic = { ...f.input, id: 'discussion', channel }
+    vi.mocked(f.runtime.store.triggers.get).mockImplementation(id => id === topic.id ? topic : undefined)
+    f.input.meta.peppyRoute = (await f.routing.issue({ discussion: topic.id }, 'user-token', f.account)).route
+    await f.routing.receive(f.input)
+    expect(f.attach).not.toHaveBeenCalled()
+    expect(f.receive).toHaveBeenCalledWith(expect.objectContaining({
+      routeToRouter: true, contextChannel: channel, threads: [{ source: 'huly', id: channel.thread }, f.input.threads[0]],
+      meta: expect.objectContaining({ discussionId: topic.id })
+    }))
+    expect(f.receive.mock.calls.at(-1)?.[0]).not.toHaveProperty('newTicket')
+  })
   it('rejects issuance to a read-only reader, stopped work or mixed-source evidence', async () => {
     const f = fixture(); f.ticket.channels.push({ source: 'github', address: {} } as never)
     await expect(f.routing.issue('ticket', 'user-token', f.account)).rejects.toMatchObject({ status: 403 })

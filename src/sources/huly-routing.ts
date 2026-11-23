@@ -5,31 +5,66 @@ import { type Ticket, type Trigger, type ReceiveResult, UserError } from '../cor
 import { allowedSender } from '../policy.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from './huly-client.ts'
 
+/** Include physical message sources for older attached tickets, whose original channel list predates discussion selection. */
+export function hulyTaskSources(runtime: Runtime, ticket: Ticket) {
+  const channels = [...ticket.channels]
+  for (const input of ticket.inputs ?? []) {
+    if (input.kind !== 'trigger') continue
+    const trigger = runtime.store.triggers.get(input.triggerId)
+    if (trigger?.channel) channels.push(trigger.channel)
+    if (trigger?.contextChannel) channels.push(trigger.contextChannel)
+  }
+  return channels
+}
 export async function mayReadHulyTask(runtime: Runtime, client: HulyClient, ticket: Ticket, token: string): Promise<boolean> {
   const enabled = runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels ?? []
-  if (!ticket.channels.length || !ticket.channels.every(c => c.source === 'huly' && c.address.workspace === client.deployment.workspace && enabled.includes(c.address.channelId!))) return false
-  for (const channel of new Set(ticket.channels.map(c => c.address.channelId!))) if (!await client.one(HULY.channel, channel, token)) return false
+  const channels = hulyTaskSources(runtime, ticket)
+  if (!channels.length || !channels.every(c => c.source === 'huly' && c.address.workspace === client.deployment.workspace && enabled.includes(c.address.channelId!))) return false
+  for (const channel of new Set(channels.map(c => c.address.channelId!))) if (!await client.one(HULY.channel, channel, token)) return false
   return true
 }
 export function mayWriteHulyTask(client: HulyClient, ticket: Ticket, a: HulyAccount): boolean {
   return ticket.ended?.by !== 'human' && (client.deployment.operators.includes(a.uuid) || ['OWNER', 'ADMIN'].includes(a.role)
     || ticket.mandate.actor.source === 'huly' && a.socialIds.includes(ticket.mandate.actor.id))
 }
-interface Grant { token: string; account: string; actors: string[]; task: string; expires: number }
+export interface HulyChoice { task?: string; discussion?: string }
+interface Grant extends HulyChoice { token: string; account: string; actors: string[]; expires: number }
+export function hulyDiscussionTitle(trigger: Trigger): string {
+  return trigger.text.replace(/@?Team\s*Peppy/ig, '').trim().slice(0, 80) || '频道讨论'
+}
+export function hulyMayChoose(runtime: Runtime, account: HulyAccount): boolean {
+  const settings = runtime.store.settings()
+  return account.socialIds.some(id => allowedSender(settings, { source: 'huly', id }))
+}
+function sameDiscussion(ticket: Ticket, input: Trigger): boolean {
+  return ticket.channels.some(c => c.source === 'huly' && c.thread === input.channel?.thread)
+}
+export async function hulyDiscussion(runtime: Runtime, client: HulyClient, id: string, token: string): Promise<Trigger> {
+  const trigger = runtime.store.triggers.get(id)
+  if (!trigger?.human || trigger.addressed !== 'mention' || trigger.source !== 'huly' || trigger.meta.surface || trigger.meta.discussionId ||
+    trigger.meta.workspace !== client.deployment.workspace || !trigger.channel || runtime.store.triggers.disposition(id)?.filtered ||
+    !runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels.includes(trigger.channel.address.channelId!) ||
+    !await client.one(HULY.channel, trigger.channel.address.channelId!, token)) throw new HulyError(404, '此讨论已不可访问')
+  return trigger
+}
 /** Validates a member’s optional choice at issuance and again at source intake, then uses the native Engine. */
 export class HulyRouting {
   private grants = new Map<string, Grant>()
   constructor(private runtime: Runtime, private client: HulyClient) {}
-  async issue(task: string, token: string, account: HulyAccount): Promise<{ route: string; expires: number }> {
+  async issue(choice: string | HulyChoice, token: string, account: HulyAccount): Promise<{ route: string; expires: number }> {
     this.prune()
     if (this.grants.size >= 1000) throw new HulyError(429, '请稍后重试')
-    if (!account.socialIds.some(id => allowedSender(this.runtime.store.settings(), { source: 'huly', id }))) throw new HulyError(403, '当前成员无权发起任务')
-    if (task !== 'new') {
+    if (!hulyMayChoose(this.runtime, account)) throw new HulyError(403, '当前账号未获 Team Peppy 任务发起权限')
+    const { task, discussion } = typeof choice === 'string' ? { task: choice, discussion: undefined } : choice
+    if (!task && !discussion) throw new HulyError(400, '请选择讨论或工作会话')
+    const parent = discussion ? await hulyDiscussion(this.runtime, this.client, discussion, token) : undefined
+    if (task && task !== 'new') {
       const ticket = this.runtime.store.tickets.get(task)
-      if (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, token) || !mayWriteHulyTask(this.client, ticket, account)) throw new HulyError(403, '无法选择此会话')
+      if (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, token) || !mayWriteHulyTask(this.client, ticket, account)) throw new HulyError(403, '此工作会话已不可接手')
+      if (parent && !sameDiscussion(ticket, parent)) throw new HulyError(409, '此工作会话不属于所选讨论')
     }
     const route = randomUUID(), expires = Date.now() + 30 * 60_000
-    this.grants.set(route, { token, account: account.uuid, actors: account.socialIds, task, expires })
+    this.grants.set(route, { token, account: account.uuid, actors: account.socialIds, task, discussion, expires })
     return { route, expires }
   }
   private prune(): void { for (const [id, grant] of this.grants) if (grant.expires < Date.now()) this.grants.delete(id) }
@@ -44,12 +79,19 @@ export class HulyRouting {
       if (!grant || !grant.actors.includes(trigger.actor.id) || !allowedSender(this.runtime.store.settings(), trigger.actor)) throw new HulyError(409, 'Expired selection')
       const account = await this.client.account(grant.token)
       if (account.uuid !== grant.account || !account.socialIds.includes(trigger.actor.id) || !await this.client.one(HULY.channel, String(trigger.meta.channelId), grant.token)) throw new HulyError(403, 'Membership changed')
-      const ticket = grant.task === 'new' ? undefined : this.runtime.store.tickets.get(grant.task)
-      if (grant.task !== 'new' && (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, grant.token) || !mayWriteHulyTask(this.client, ticket, account))) throw new HulyError(403, 'Task access changed')
+      const parent = grant.discussion ? await hulyDiscussion(this.runtime, this.client, grant.discussion, grant.token) : undefined
+      const ticket = grant.task && grant.task !== 'new' ? this.runtime.store.tickets.get(grant.task) : undefined
+      if (grant.task && grant.task !== 'new' && (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, grant.token) || !mayWriteHulyTask(this.client, ticket, account))) throw new HulyError(403, 'Task access changed')
       // A private primary evaluation lane isolates a new request; verified core routing limits fan-out.
       // Keep original native Threads too, so later unmentioned discussion reaches the selected worker.
-      const routed: Trigger = { ...trigger, threads: [{ source: 'huly', id: `selected:${trigger.id}` }, ...trigger.threads],
-        ...(ticket ? { targetTicket: ticket.id } : { newTicket: true }), meta: { ...trigger.meta, peppyRoute: undefined, sessionChoice: grant.task, statusVersion: 2 } }
+      if (parent && ticket && !sameDiscussion(ticket, parent)) throw new HulyError(409, '此工作会话已不属于所选讨论')
+      const discussionThread = parent?.channel?.thread
+      const primary = { source: 'huly', id: !grant.task && discussionThread ? discussionThread : `selected:${trigger.id}` }
+      const threads = [primary, ...trigger.threads]
+      if (discussionThread) threads.push({ source: 'huly', id: discussionThread })
+      const routed: Trigger = { ...trigger, threads: [...new Map(threads.map(t => [t.id, t])).values()],
+        ...(ticket ? { targetTicket: ticket.id } : grant.task === 'new' ? { newTicket: true } : { routeToRouter: true }),
+        contextChannel: parent?.channel, meta: { ...trigger.meta, peppyRoute: undefined, sessionChoice: grant.task, discussionId: parent?.id, discussionUrl: parent?.url } }
       const result = this.runtime.store.atomic(() => {
         const result = this.runtime.engine.receive(routed)
         const disposition = this.runtime.store.triggers.disposition(routed.id)

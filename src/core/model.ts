@@ -34,6 +34,10 @@ export interface Trigger {
   newTicket?: true
   /** Source-verified optional target; automatic subscription fan-out must not send this input elsewhere. */
   targetTicket?: string
+  /** A verified discussion selection goes to the Router before any worker. */
+  routeToRouter?: true
+  /** Additional source evidence authorized with the selected discussion. */
+  contextChannel?: ChannelRef
   at: string
   text: string
   channel?: ChannelRef

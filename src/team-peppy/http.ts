@@ -10,7 +10,7 @@ import { key, UserError, ticketStage, type Ticket, type Trigger } from '../core/
 import { workerSessionId } from '../executor/dsh.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from '../sources/huly-client.ts'
 import { contextView } from './context.ts'
-import { HulyRouting } from '../sources/huly-routing.ts'
+import { HulyRouting, hulyDiscussionTitle, hulyMayChoose, hulyTaskSources, mayReadHulyTask, mayWriteHulyTask } from '../sources/huly-routing.ts'
 import { hulyInputState, hulyMessageStatus, statusCutover } from '../sources/huly-feedback.ts'
 
 const Send = z.object({ sessionId: z.string(), requestId: z.string().uuid(), text: z.string().trim().min(1).max(40_000), mode: z.literal('steer').default('steer') }).strict()
@@ -45,8 +45,14 @@ export function publicEvent(value: unknown): Record<string, unknown> | undefined
   if (event.type === 'turn/end') return { seq: event.seq, time: event.time, role: 'activity', phase: 'idle', text: data?.reason === 'cancelled' ? '当前轮已中断' : '本轮处理已结束，等待后续消息' }
   if (event.type === 'user/message' || event.type === 'assistant/message') {
     const content = event.type === 'assistant/message' ? data?.message?.content : data?.content
-    const text = content?.flatMap(b => { const block = b as { type?: string; text?: string }; return block.type === 'text' && typeof block.text === 'string' ? [block.text] : [] }).join('\n') ?? ''
+    let text = content?.flatMap(b => { const block = b as { type?: string; text?: string }; return block.type === 'text' && typeof block.text === 'string' ? [block.text] : [] }).join('\n') ?? ''
     if (!text || event.type === 'user/message' && data?.source?.kind === 'notice') return
+    if (event.type === 'user/message') {
+      try {
+        const message = JSON.parse(text) as { trigger_id?: unknown; thread?: unknown; text?: unknown }
+        if (typeof message?.trigger_id === 'string' && typeof message.thread === 'string' && typeof message.text === 'string') text = message.text
+      } catch { /* Ordinary conversation is already display text. */ }
+    }
     return { seq: event.seq, time: event.time, role: event.type === 'user/message' ? 'user' : 'assistant', text }
   }
   if (event.type === 'tool/result') return { seq: event.seq, time: event.time, role: 'tool', text: '工具调用已返回' }
@@ -63,15 +69,8 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
   const d = huly.deployment
   if (!runtime.store.get(statusCutover(d.workspace))) runtime.store.set(statusCutover(d.workspace), new Date().toISOString())
   const allowedChannels = () => runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels ?? []
-  const mayRead = async (ticket: Ticket, token: string) => {
-    const channels = ticketChannels(ticket, d.workspace)
-    if (!channels.length || channels.some(c => !allowedChannels().includes(c))) return false
-    for (const id of channels) if (!await huly.one(HULY.channel, id, token)) return false
-    // Cross-source threads may contain evidence with different permissions. Fail closed in v1.
-    return ticket.channels.every(c => c.source === 'huly' && c.address.workspace === d.workspace)
-  }
-  const mayWrite = (ticket: Ticket, a: HulyAccount) => d.operators.includes(a.uuid) || a.role === 'OWNER' || a.role === 'ADMIN'
-    || ticket.mandate.actor.source === 'huly' && a.socialIds.includes(ticket.mandate.actor.id)
+  const mayRead = (ticket: Ticket, token: string) => mayReadHulyTask(runtime, huly, ticket, token)
+  const mayWrite = (ticket: Ticket, account: HulyAccount) => mayWriteHulyTask(huly, ticket, account)
   const task = (ticket: Ticket, canWrite: boolean) => ({ id: ticket.id, title: ticket.title, createdAt: ticket.createdAt,
     state: ticketStage(ticket), ended: ticket.ended, report: ticket.assignments.at(-1)?.report,
     sessionId: ticket.assignments.some(a => a.startedAt) ? workerSessionId(ticket.id) : null,
@@ -93,11 +92,51 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
     try {
       await runtime.ready
       const token = requestToken(req, d.workspace), account = await huly.account(token)
-      if (req.method !== 'GET' && (!origin || req.headers['x-team-peppy-request'] !== '1')) throw new HulyError(403, 'Same-origin request required')
+      if (req.method !== 'GET') {
+        const fetchSite = req.headers['sec-fetch-site']
+        const requestFromHuly = origin === d.origin || (!origin && (fetchSite === 'same-origin'
+          || (!fetchSite && req.headers.authorization === `Bearer ${token}`)))
+        // Pepper's embedded browser can omit Origin. Only browser-asserted same-origin
+        // requests or explicit credentials may use that path; a cookie alone is insufficient.
+        if (!requestFromHuly || (fetchSite && fetchSite !== 'same-origin') || req.headers['x-team-peppy-request'] !== '1') {
+          throw new HulyError(403, '请从当前 Huly 工作区发起操作')
+        }
+      }
       if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid, botPerson: d.botPerson }); return }
+      if (path === '/api/route-options' && req.method === 'GET') {
+        if (!hulyMayChoose(runtime, account)) { json(res, 200, { canChoose: false, discussions: [], reason: '当前账号未获 Team Peppy 任务发起权限' }); return }
+        const roots = runtime.store.read.hulyDiscussionRoots(d.workspace)
+        const channels = new Map<string, Promise<string | undefined>>()
+        const access = (id: string) => {
+          if (!channels.has(id)) channels.set(id, allowedChannels().includes(id)
+            ? huly.one(HULY.channel, id, token).then(channel => channel ? String(channel.name ?? '频道') : undefined)
+            : Promise.resolve(undefined))
+          return channels.get(id)!
+        }
+        const byThread = new Map<string, Array<{ id: string; title: string; ended: boolean }>>()
+        for (const row of runtime.store.tickets.list().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
+          if (!row.assignments.some(a => a.startedAt) || !mayWrite(row, account)) continue
+          const sources = hulyTaskSources(runtime, row)
+          if (!sources.length || !sources.every(c => c.source === 'huly' && c.address.workspace === d.workspace) ||
+            !(await Promise.all(sources.map(c => access(c.address.channelId!)))).every(Boolean)) continue
+          for (const thread of new Set(row.channels.map(c => c.thread))) {
+            const items = byThread.get(thread) ?? []
+            items.push({ id: row.id, title: row.title, ended: !!row.ended })
+            byThread.set(thread, items)
+          }
+        }
+        const discussions = []
+        for (const root of roots) {
+          if (!root.channel) continue
+          const channel = await access(root.channel.address.channelId!)
+          if (channel) discussions.push({ id: root.id, title: hulyDiscussionTitle(root), channel, sessions: byThread.get(root.channel.thread) ?? [] })
+        }
+        json(res, 200, { canChoose: true, discussions }); return
+      }
       if (path === '/api/route' && req.method === 'POST') {
-        const value = z.object({ task: z.string().min(1).max(200) }).strict().parse(await body(req))
-        json(res, 200, await routing.issue(value.task, token, account)); return
+        const id = z.string().min(1).max(200)
+        const value = z.object({ task: id.optional(), discussion: id.optional() }).strict().parse(await body(req))
+        json(res, 200, await routing.issue(value, token, account)); return
       }
       const discussion = path.match(/^\/api\/conversations\/([^/]+)$/)
       if (discussion && req.method === 'GET') {

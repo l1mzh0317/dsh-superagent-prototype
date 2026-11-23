@@ -63,7 +63,7 @@ export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): 
     threadContext: {
       messageId: t => String(t.meta.messageId),
       async read(_, trigger, part, cursor) {
-        const root = String(trigger.meta.rootId)
+        const root = trigger.contextChannel?.address.rootId ?? String(trigger.meta.rootId)
         const rows = part === 'root' || part === 'parent' ? [await client.one(HULY.message, root)].filter((x): x is HulyDoc => !!x)
           : await client.find(HULY.reply, { attachedTo: root }, { limit: 50, skip: Number(cursor ?? 0), sort: { createdOn: 1, _id: 1 } })
         const messages = rows.map(m => ({ id: m._id, from: m.createdBy ?? m.modifiedBy, at: new Date(m.createdOn ?? m.modifiedOn).toISOString(),

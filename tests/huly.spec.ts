@@ -104,6 +104,7 @@ describe('Team Peppy presentation boundaries', () => {
     expect(() => requestToken({ headers: { authorization: `Bearer ${token}` } }, d.workspace)).toThrow('工作区')
   })
   it('omits internal prompts and reasoning while retaining visible conversation text', () => {
+    expect(publicEvent({ type: 'user/message', data: { content: [{ type: 'text', text: JSON.stringify({ trigger_id: 'id', thread: 'huly:root', text: '原消息', source_url: 'https://example.test/thread' }) }] } })).toMatchObject({ text: '原消息' })
     expect(publicEvent({ type: 'system/message', seq: 1, data: { content: [{ type: 'text', text: 'secret' }] } })).toBeUndefined()
     expect(publicEvent({ type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'reasoning', text: 'private' }, { type: 'text', text: 'public' }] } } })).toMatchObject({ role: 'assistant', text: 'public' })
     expect(publicEvent({ type: 'tool/result', seq: 3, data: { content: [{ type: 'text', text: 'credential' }] } })).not.toHaveProperty('text', 'credential')

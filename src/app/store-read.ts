@@ -10,6 +10,20 @@ export function storeReads(db: DatabaseSync) {
   messageTriggers: (source: string, workspace: string, ids: string[]): Trigger[] => ids.length ? values<Trigger>(
     `SELECT value FROM trigger WHERE json_extract(value, '$.source') = ? AND json_extract(value, '$.meta.workspace') = ?
       AND json_extract(value, '$.human') = 1 AND json_extract(value, '$.meta.messageId') IN (${ids.map(() => '?').join(',')}) ORDER BY rowid DESC`, source, workspace, ...ids) : [],
+  /** One canonical addressed input per Huly thread, ordered by recent Router activity. */
+  hulyDiscussionRoots: (workspace: string, limit = 100): Trigger[] => values<Trigger>(
+    `WITH mentions AS (
+      SELECT t.value, t.at, ROW_NUMBER() OVER (PARTITION BY json_extract(t.value, '$.meta.channelId'), json_extract(t.value, '$.meta.rootId') ORDER BY t.at, t.rowid) AS first,
+        MAX(t.at) OVER (PARTITION BY json_extract(t.value, '$.meta.channelId'), json_extract(t.value, '$.meta.rootId')) AS latest
+      FROM trigger t LEFT JOIN disposition d ON t.id = d.id
+      WHERE json_extract(t.value, '$.source') = 'huly' AND json_extract(t.value, '$.meta.workspace') = ?
+        AND json_extract(t.value, '$.addressed') = 'mention' AND json_extract(t.value, '$.human') = 1
+        AND json_extract(t.value, '$.meta.discussionId') IS NULL AND json_extract(t.value, '$.meta.surface') IS NULL
+        AND json_extract(d.value, '$.filtered') IS NULL
+    ) SELECT value FROM mentions WHERE first = 1 ORDER BY latest DESC LIMIT ?`, workspace, limit),
+  hulyDiscussionMessages: (workspace: string, discussion: string, limit = 100): Trigger[] => values<Trigger>(
+    `SELECT value FROM trigger WHERE json_extract(value, '$.source') = 'huly' AND json_extract(value, '$.meta.workspace') = ?
+      AND json_extract(value, '$.meta.discussionId') = ? ORDER BY at DESC, rowid DESC LIMIT ?`, workspace, discussion, limit),
   hulyThreadMessages: (workspace: string, channel: string, root: string, limit = 1000): Trigger[] => values<Trigger>(
     `SELECT value FROM trigger WHERE json_extract(value, '$.source') = 'huly' AND json_extract(value, '$.meta.workspace') = ?
       AND json_extract(value, '$.meta.channelId') = ? AND json_extract(value, '$.meta.rootId') = ?

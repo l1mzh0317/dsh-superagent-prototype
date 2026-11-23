@@ -70,16 +70,21 @@ function openSession(t) {
   if (t.conversation) {
     generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''
     sessionRequested = true; locationForTask(); $('session-panel').hidden = false; $('layout').classList.add('session-open')
-    $('session-title').textContent = t.title; $('session-state').textContent = '频道讨论'
-    $('view-worker').disabled = true; $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
+    $('session-title').textContent = t.title; $('session-state').textContent = '频道讨论 · 暂无工作会话'
+    $('view-worker').hidden = true; $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
     setSessionView('context'); return
   }
-  $('view-worker').disabled = false
+  $('view-worker').hidden = !!t.ended && !t.sessionId
   sessionRequested = true; locationForTask()
   if (!t.sessionId) {
     generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''; renderMessages()
     $('session-panel').hidden = false; $('layout').classList.add('session-open')
-    $('session-title').textContent = t.sessionName || t.title; $('session-state').textContent = '等待创建 worker session'
+    $('session-title').textContent = t.sessionName || t.title
+    if (t.ended) {
+      $('session-state').textContent = '任务已结束 · 未创建工作会话'
+      setSessionView('context'); return
+    }
+    $('session-state').textContent = '等待创建工作会话'
     activity('排队中，等待分配 worker'); feedback('会话创建后会自动连接。')
     $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
     return
