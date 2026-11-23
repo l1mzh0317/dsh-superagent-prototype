@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { get } from 'node:http'
-import { isIP } from 'node:net'
+import { createConnection, isIP } from 'node:net'
 import { z } from 'zod'
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
@@ -29,16 +28,22 @@ const serviceNote = (service: z.infer<typeof serviceInput>): string => service.n
 const sameService = (first: z.infer<typeof serviceInput>, second: z.infer<typeof serviceInput>): boolean =>
   first.port === second.port && first.protocol === second.protocol && serviceNote(first) === serviceNote(second)
 const machineInput = z.object({ name: label, address, service: serviceInput }).strict()
+const grantMembers = z.array(z.object({ account: z.string().min(1).max(80), login }).strict()).min(1).max(50)
 const grantInput = z.object({
   serviceId: id,
-  members: z.array(z.object({ account: z.string().min(1).max(80), login }).strict()).min(1).max(50),
+  members: grantMembers,
   group: z.string().trim().max(80).regex(/^group:[a-zA-Z0-9_-]+$/).optional(),
 }).strict()
+const batchInput = z.object({
+  serviceIds: z.array(id).min(2).max(30).refine(ids => new Set(ids).size === ids.length),
+  members: grantMembers,
+}).strict()
+type GrantInput = z.infer<typeof grantInput>
 type Service = z.infer<typeof serviceInput> & { id: string }
 interface Machine { id: string; name: string; address: string; services: Service[] }
 type GrantState = 'pending' | 'applied' | 'revoking' | 'revoked'
-type Grant = z.infer<typeof grantInput> & {
-  id: string; state: GrantState; updatedAt: string; updatedBy: string
+type Grant = GrantInput & {
+  id: string; batchId?: string; state: GrantState; updatedAt: string; updatedBy: string
 }
 interface Registry { machines: Machine[]; grants: Grant[]; managers?: string[] }
 const registryKey = family<Registry>('huly-instances:')
@@ -47,7 +52,7 @@ const delegatedRoles = new Set(['MAINTAINER', 'USER'])
 const members = new Set(['OWNER', 'ADMIN', 'MAINTAINER', 'USER'])
 const employeeClass = 'contact:mixin:Employee'
 
-function policy(grant: z.infer<typeof grantInput>, ip: string, port: number, revoking = false) {
+function policy(grant: GrantInput, ip: string, port: number, revoking = false) {
   const src = grant.group ? [grant.group] : grant.members.map(member => member.login)
   const destination = `${ip.includes(':') ? `[${ip}]` : ip}:${port}`
   // Each identity is tested independently, including members of a named Tailscale group.
@@ -57,35 +62,26 @@ function policy(grant: z.infer<typeof grantInput>, ip: string, port: number, rev
   }
 }
 
-async function hostProbe(address: string, port: number): Promise<boolean> {
-  const socketPath = process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET
-  if (!socketPath) throw new HulyError(503, '团队服务器尚未启用连通性检查')
-  const path = '/probe?' + new URLSearchParams({ address, port: String(port) })
-  return await new Promise((resolve, reject) => {
-    const unavailable = () => reject(new HulyError(503, '暂时无法运行团队服务器检查，请重试'))
-    const request = get({ socketPath, path, signal: AbortSignal.timeout(5000) }, res => {
-      if (res.statusCode !== 200) { res.resume(); unavailable(); return }
-      res.setEncoding('utf8')
-      let value = ''
-      res.on('data', chunk => { value += chunk; if (value.length > 256) { res.destroy(); unavailable() } })
-      res.on('error', unavailable)
-      res.on('end', () => {
-        try {
-          const result = JSON.parse(value) as { reachable: unknown }
-          if (typeof result.reachable !== 'boolean') { unavailable(); return }
-          resolve(result.reachable)
-        } catch { unavailable() }
-      })
-    })
-    request.on('error', unavailable)
+/** Use the same network namespace and routes as the Team Peppy runtime. */
+async function runtimeProbe(address: string, port: number): Promise<boolean> {
+  if (!isTailnetIP(address) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new HulyError(400, '服务的 Tailscale 地址或端口无效')
+  }
+  return await new Promise(resolve => {
+    const socket = createConnection({ host: address, port, timeout: 3000 })
+    const finish = (reachable: boolean) => { socket.destroy(); resolve(reachable) }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.once('timeout', () => finish(false))
   })
 }
 
+/** Workspace service catalog, access grants, and Team Peppy connectivity checks. */
 export class Instances {
   private readonly key
   private readonly probes = new Map<string, Promise<boolean>>()
 
-  constructor(private readonly store: Store, private readonly huly: HulyClient, private readonly probe = hostProbe) {
+  constructor(private readonly store: Store, private readonly huly: HulyClient, private readonly probe = runtimeProbe) {
     this.key = registryKey(huly.deployment.workspace)
   }
 
@@ -129,6 +125,56 @@ export class Instances {
       { limit: accounts?.length ?? 1000, sort: { name: 1 } }, token)
     return rows.flatMap(row => typeof row.personUuid === 'string' && typeof row.name === 'string' && row.role !== 'GUEST' &&
       row.personUuid !== this.huly.deployment.botAccount ? [{ account: row.personUuid, name: row.name }] : [])
+  }
+
+  private async validateRecipients(recipients: GrantInput['members'], token: string): Promise<void> {
+    const accounts = [...new Set(recipients.map(member => member.account))]
+    const logins = new Set(recipients.map(member => member.login))
+    if (accounts.length !== recipients.length || logins.size !== recipients.length) {
+      throw new HulyError(400, '每位成员需要不同的 Tailscale 登录名')
+    }
+    const people = await this.directory(token, accounts)
+    if (!accounts.every(account => people.some(person => person.account === account))) {
+      throw new HulyError(400, '请选择当前工作区的有效成员')
+    }
+  }
+
+  private pendingGrant(registry: Registry, input: GrantInput): Grant | undefined {
+    for (const grant of registry.grants) {
+      if (grant.serviceId !== input.serviceId || grant.state === 'revoked') continue
+      const overlap = grant.members.some(entry => input.members.some(member => entry.account === member.account || entry.login === member.login))
+      const sameGroup = grant.group !== undefined && grant.group === input.group
+      if (!overlap && !sameGroup) continue
+      if (grant.state === 'pending' && grant.group === input.group && grant.members.length === input.members.length &&
+        grant.members.every(entry => input.members.some(member => member.account === entry.account && member.login === entry.login))) return grant
+      const { machine, service } = this.service(registry, input.serviceId)
+      throw new HulyError(409, `${machine.name} 的端口 ${service.port} 已有这些账号或组的授权记录`)
+    }
+  }
+
+  private batchPolicy(registry: Registry, inputs: GrantInput[]) {
+    const policies = inputs.map(input => {
+      const { machine, service } = this.service(registry, input.serviceId)
+      return policy(input, machine.address, service.port)
+    })
+    const destinations = new Map<string, string[]>()
+    for (const { tests } of policies) {
+      for (const test of tests) {
+        const ports = destinations.get(test.src) ?? []
+        ports.push(...(test.accept ?? []))
+        destinations.set(test.src, ports)
+      }
+    }
+    return {
+      grants: policies.map(entry => entry.grant),
+      tests: [...destinations].map(([src, accept]) => ({ src, proto: 'tcp', accept })),
+    }
+  }
+
+  private batchGrants(registry: Registry, batchId: string): Grant[] {
+    const grants = registry.grants.filter(grant => grant.batchId === batchId)
+    if (!grants.length) throw new HulyError(404, '这批授权已不可用')
+    return grants
   }
 
   private async eligibleManager(account: string, token: string): Promise<boolean> {
@@ -233,29 +279,70 @@ export class Instances {
       case 'preview':
       case 'grants': {
         const value = grantInput.parse(data)
-        const accounts = [...new Set(value.members.map(member => member.account))]
-        const logins = new Set(value.members.map(member => member.login))
-        if (accounts.length !== value.members.length || logins.size !== value.members.length) throw new HulyError(400, '每位成员需要不同的 Tailscale 登录名')
         const { machine, service } = this.service(registry, value.serviceId)
-        const people = await this.directory(token, accounts)
-        if (!accounts.every(accountId => people.some(person => person.account === accountId))) throw new HulyError(400, '请选择当前工作区的有效成员')
-        const preview = policy(value, machine.address, service.port)
-        if (operation === 'preview') return preview
+        await this.validateRecipients(value.members, token)
+        if (operation === 'preview') return policy(value, machine.address, service.port)
         return updateManaged(current => {
-          const existing = current.grants.filter(grant => grant.serviceId === value.serviceId && grant.state !== 'revoked')
-          for (const grant of existing) {
-            const overlap = grant.members.some(entry => value.members.some(member => entry.account === member.account || entry.login === member.login))
-            const sameGroup = grant.group !== undefined && grant.group === value.group
-            if (!overlap && !sameGroup) continue
-            if (grant.state === 'pending' && grant.group === value.group && grant.members.length === value.members.length &&
-              grant.members.every(entry => value.members.some(member => member.account === entry.account && member.login === entry.login))) {
-              return { id: grant.id }
-            }
-            throw new HulyError(409, '选中的成员或组已有此服务的授权记录')
-          }
+          const pending = this.pendingGrant(current, value)
+          if (pending) return { id: pending.id }
           const grant: Grant = { ...value, id: randomUUID(), state: 'pending', updatedAt: new Date().toISOString(), updatedBy: account.uuid }
           current.grants.push(grant)
           return { id: grant.id }
+        })
+      }
+      case 'preview-batch':
+      case 'grant-batch': {
+        const { serviceIds, members } = batchInput.parse(data)
+        await this.validateRecipients(members, token)
+        const inputs = serviceIds.map(serviceId => ({ serviceId, members }))
+        if (operation === 'preview-batch') {
+          const preview = this.batchPolicy(registry, inputs)
+          for (const input of inputs) this.pendingGrant(registry, input)
+          return preview
+        }
+        return updateManaged(current => {
+          for (const input of inputs) this.service(current, input.serviceId)
+          const pending = inputs.flatMap(input => {
+            const grant = this.pendingGrant(current, input)
+            return grant ? [grant] : []
+          })
+          if (pending.length) {
+            const batchId = pending[0]!.batchId
+            if (batchId && pending.length === inputs.length && pending.every(grant => grant.batchId === batchId) &&
+              this.batchGrants(current, batchId).length === inputs.length) return { id: batchId }
+            throw new HulyError(409, '部分服务已有待应用授权，请先在服务授权中处理')
+          }
+          const id = randomUUID(), updatedAt = new Date().toISOString()
+          current.grants.push(...inputs.map(input => ({
+            ...input, id: randomUUID(), batchId: id, state: 'pending' as const, updatedAt, updatedBy: account.uuid,
+          })))
+          return { id }
+        })
+      }
+      case 'batch-policy': {
+        const { batchId } = z.object({ batchId: id }).strict().parse(data)
+        const pending = this.batchGrants(registry, batchId).filter(grant => grant.state === 'pending')
+        if (!pending.length) throw new HulyError(409, '这批授权没有等待应用的服务')
+        return this.batchPolicy(registry, pending)
+      }
+      case 'batch-state': {
+        const { batchId, action } = z.object({ batchId: id, action: z.enum(['confirm', 'discard']) }).strict().parse(data)
+        const pending = this.batchGrants(registry, batchId).find(grant => grant.state === 'pending')
+        if (action === 'confirm' && pending) await this.validateRecipients(pending.members, token)
+        return updateManaged(current => {
+          const grants = this.batchGrants(current, batchId)
+          const next = action === 'confirm' ? 'applied' : 'revoked'
+          if (grants.some(grant => grant.state !== 'pending' && grant.state !== next)) {
+            throw new HulyError(409, '这批授权的状态已变化，请刷新后分别处理')
+          }
+          const now = new Date().toISOString()
+          for (const grant of grants) {
+            if (grant.state === next) continue
+            grant.state = next
+            grant.updatedAt = now
+            grant.updatedBy = account.uuid
+          }
+          return { state: next }
         })
       }
       case 'grant-policy': {

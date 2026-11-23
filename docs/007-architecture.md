@@ -374,6 +374,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/team-peppy/context.ts` | Read-only ticket/message context graph and chronological projection |
 | `src/sources/huly-feedback.ts` | Read-only message-header status derived from native task state and explicit-mention answer reminders |
 | `src/team-peppy/http.ts` | Huly-authenticated task views and original worker Session read, input and cancellation |
+| `src/team-peppy/instances.ts` | Workspace service catalog, access grants and TCP checks from the Team Peppy runtime |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |

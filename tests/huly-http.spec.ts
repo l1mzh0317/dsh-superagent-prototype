@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { connect, createConnection } from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Runtime } from '../src/app/runtime.ts'
 import type { Ticket } from '../src/core/index.ts'
 import { HulyClient, type HulyDeployment } from '../src/sources/huly-client.ts'
 import { registerTeamPeppy } from '../src/team-peppy/http.ts'
+
+vi.mock('node:net', async importOriginal => {
+  const net = await importOriginal<typeof import('node:net')>()
+  return { ...net, createConnection: vi.fn(net.createConnection) }
+})
 
 const servers: Server[] = []
 afterEach(async () => { for (const s of servers.splice(0)) { s.closeAllConnections(); await new Promise<void>(r => s.close(() => r())) } })
@@ -211,6 +214,67 @@ describe('workspace Instances', () => {
     expect(await (await f.call('instances/grant-state', { grantId, action: 'confirm-revoked' })).json()).toEqual({ state: 'revoked' })
   })
 
+  it('stages account-based access to exact ports atomically and enables the whole batch after application', async () => {
+    const f = await fixture()
+    const identity = (uuid: string, role: string) => f.account.mockResolvedValue({ uuid, role, socialIds: [uuid + '-social'] })
+    identity('owner', 'OWNER')
+    const alice = { account: 'alice', login: 'alice@example.test' }, bob = { account: 'bob', login: 'bob@example.test' }
+    const people = [{ personUuid: 'alice', name: 'Alice' }, { personUuid: 'bob', name: 'Bob' }]
+    f.directory.mockResolvedValue(people as never)
+    const hosts = [
+      { name: 'A', address: '100.70.0.9', service: { protocol: 'ssh', port: 22 } },
+      { name: 'B', address: '100.70.0.10', service: { protocol: 'ssh', port: 15030 } },
+      { name: 'C', address: '100.70.0.11', service: { protocol: 'ssh', port: 2222 } },
+    ]
+    for (const host of hosts) expect((await f.call('instances/machines', host)).status).toBe(200)
+    const catalog = async () => (await (await f.call('instances')).json())
+    const [one, two, three] = (await catalog()).machines.map((m: { services: Array<{ id: string }> }) => m.services[0]!.id)
+    const selection = { serviceIds: [one, two], members: [alice, bob] }
+    const receipt = await f.call('instances/preview-batch', selection)
+    expect(receipt.status).toBe(200)
+    const rules = await receipt.json()
+    expect(rules).toEqual({
+      grants: [{ src: [alice.login, bob.login], dst: [hosts[0]!.address], ip: ['tcp:22'] },
+        { src: [alice.login, bob.login], dst: [hosts[1]!.address], ip: ['tcp:15030'] }],
+      tests: [alice, bob].map(member => ({ src: member.login, proto: 'tcp', accept: ['100.70.0.9:22', '100.70.0.10:15030'] })),
+    })
+    expect((await catalog()).grants).toEqual([])
+    const staged = await f.call('instances/grant-batch', selection)
+    expect(staged.status).toBe(200)
+    const { id: batchId } = await staged.json()
+    expect(await (await f.call('instances/grant-batch', { ...selection, serviceIds: [two, one] })).json()).toEqual({ id: batchId })
+    expect(await (await f.call('instances/batch-policy', { batchId })).json()).toEqual(rules)
+    expect((await f.call('instances/grant-batch', { ...selection, serviceIds: [one, three] })).status).toBe(409)
+    expect((await catalog()).grants).toHaveLength(2)
+
+    identity('alice', 'USER')
+    expect((await catalog()).machines).toEqual([])
+    expect((await f.call('instances/batch-state', { batchId, action: 'confirm' })).status).toBe(403)
+    identity('owner', 'OWNER')
+    f.directory.mockResolvedValue(people.slice(0, 1) as never)
+    expect((await f.call('instances/batch-state', { batchId, action: 'confirm' })).status).toBe(400)
+    expect((await catalog()).grants.every((g: { state: string }) => g.state === 'pending')).toBe(true)
+    f.directory.mockResolvedValue(people as never)
+    expect(await (await f.call('instances/batch-state', { batchId, action: 'confirm' })).json()).toEqual({ state: 'applied' })
+    expect(await (await f.call('instances/batch-state', { batchId, action: 'confirm' })).json()).toEqual({ state: 'applied' })
+    expect((await f.call('instances/batch-state', { batchId, action: 'discard' })).status).toBe(409)
+
+    for (const member of [alice, bob]) {
+      identity(member.account, 'USER')
+      expect((await catalog()).machines.map((m: { name: string }) => m.name)).toEqual(['A', 'B'])
+      expect(await (await f.call('instances/connection?service=' + two)).json()).toMatchObject({ logins: [member.login], port: 15030 })
+      expect((await f.call('instances/connection?service=' + three)).status).toBe(404)
+    }
+    identity('outside', 'USER')
+    expect((await catalog()).machines).toEqual([])
+
+    identity('owner', 'OWNER')
+    const grantId = (await catalog()).grants.find((g: { serviceId: string }) => g.serviceId === one).id
+    expect(await (await f.call('instances/grant-state', { grantId, action: 'revoke' })).json()).toEqual({ state: 'revoking' })
+    identity('alice', 'USER')
+    expect((await catalog()).machines.map((m: { name: string }) => m.name)).toEqual(['B'])
+  })
+
   it('accepts services with no note and preserves service names from older Pepper releases as notes', async () => {
     const { call, account } = await fixture()
     account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: ['owner'] })
@@ -307,35 +371,26 @@ describe('workspace Instances', () => {
     expect((await (await f.call('instances')).json()).grants).toEqual([])
   })
 
-  it('sends the registered endpoint to the host probe over the private socket', async () => {
+  it('checks only the registered endpoint through the Team Peppy process network', async () => {
     const f = await fixture()
     f.account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: ['owner-social'] })
     const host = { name: 'Logs', address: '100.71.0.9', service: { name: 'HTTPS', protocol: 'https', port: 8443 } }
     await f.call('instances/machines', host)
     const serviceId = (await (await f.call('instances')).json()).machines[0].services[0].id
-    const temp = await mkdtemp(join(tmpdir(), 'pepper-probe-'))
-    const socketPath = join(temp, 'probe.sock')
-    const paths: (string | undefined)[] = []
-    const server = createServer((req, res) => {
-      paths.push(req.url)
-      res.end(JSON.stringify({ reachable: true }))
-    })
-    const previous = process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET
-    try {
-      await new Promise<void>(resolve => server.listen(socketPath, resolve))
-      process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET = socketPath
-      expect((await f.call('instances/probe', { serviceId, address: '127.0.0.1' })).status).toBe(400)
-      const checked = await f.call('instances/probe', { serviceId })
-      expect(checked.status).toBe(200)
-      expect(await checked.json()).toMatchObject({ reachable: true, checkedAt: expect.any(String) })
-      expect(paths).toEqual(['/probe?address=100.71.0.9&port=8443'])
-    } finally {
-      if (previous === undefined) delete process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET
-      else process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET = previous
-      server.closeAllConnections()
-      await new Promise<void>(resolve => server.close(() => resolve()))
-      await rm(temp, { recursive: true })
-    }
+    const listener = createServer()
+    servers.push(listener)
+    await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', resolve))
+    const localPort = (listener.address() as AddressInfo).port
+    const dial = vi.mocked(createConnection)
+    dial.mockClear()
+    // Redirect the real TCP attempt into the test runner's network without requiring a Tailnet.
+    dial.mockImplementationOnce(() => connect({ host: '127.0.0.1', port: localPort }))
+    expect((await f.call('instances/probe', { serviceId, address: '127.0.0.1' })).status).toBe(400)
+    expect(dial).not.toHaveBeenCalled()
+    const checked = await f.call('instances/probe', { serviceId })
+    expect(checked.status).toBe(200)
+    expect(await checked.json()).toMatchObject({ reachable: true, checkedAt: expect.any(String) })
+    expect(dial).toHaveBeenCalledExactlyOnceWith({ host: host.address, port: 8443, timeout: 3000 })
   })
 
   it('rejects arbitrary addresses, workspace switches, guest access and cross-origin changes', async () => {
