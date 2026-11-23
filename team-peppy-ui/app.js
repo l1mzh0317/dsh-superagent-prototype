@@ -9,7 +9,7 @@ window.addEventListener('message', event => {
   if (embedded && event.source === parent && event.origin === location.origin && event.data?.type === 'team-peppy:theme') applyTheme(event.data.theme)
 })
 let requestedTask = initial.get('conversation') ? `conversation:${initial.get('conversation')}` : initial.get('task'), sessionRequested = initial.get('session') === '1'
-let sessionView = 'worker', contextMode = 'graph', contextTask, contextData, contextRequest = 0
+let sessionView = 'worker', contextMode = 'graph', contextTask, contextData, contextRequest = 0, contextPending
 const drafts = new Map(), requests = new Map(), records = new Map()
 const labels = { working: '进行中', person: '待处理', idle: '等待消息', ended: '已结束' }
 const stateText = t => t.ended ? '已结束' : t.state.action === 'queued' ? '排队中' : labels[t.state.stage] || t.state.stage
@@ -143,13 +143,16 @@ function setSessionView(view) {
   for (const id of ['messages', 'session-activity', 'session-feedback', 'composer']) $(id).hidden = view !== 'worker'
 }
 async function loadContext(t) {
+  if (contextPending?.id === t.id) return
   const own = ++contextRequest
+  const pending = { id: t.id, own }; contextPending = pending
   if (!contextData) $('context-feedback').textContent = '正在读取关联消息…'
   try {
     const value = t.conversation ? (await api(`conversations/${encodeURIComponent(t.id.slice(13))}`)).context : await api(`tasks/${encodeURIComponent(t.id)}/context`)
     if (own !== contextRequest || contextTask !== t.id) return
     contextData = value; $('context-count').textContent = String(value.nodes.length); renderContext()
   } catch (error) { if (own === contextRequest) { contextData = undefined; $('context-content').replaceChildren(); $('context-count').textContent = ''; $('context-feedback').textContent = error.message } }
+  finally { if (contextPending === pending) contextPending = undefined }
 }
 const inclusionText = { adopted: '已采纳', included: '已送达', context: '仅供上下文', reply: '回复' }
 function contextMessage(n) {

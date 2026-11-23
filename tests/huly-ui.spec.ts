@@ -44,6 +44,15 @@ describe('Huly reply-to-session navigation', () => {
     w.document.getElementById('view-worker')!.click()
     expect(w.document.getElementById('composer')!.hidden).toBe(false)
   })
+  it('does not starve a slow context response with repeated refresh requests', async () => {
+    const { w } = await boot([task()]); await new Promise(resolve => setTimeout(resolve, 0))
+    let finish: (value: unknown) => void = () => {}
+    w.fetch = vi.fn(() => new Promise(resolve => { finish = resolve })) as never
+    w.document.getElementById('view-context')!.click(); w.document.getElementById('view-context')!.click()
+    expect(w.fetch).toHaveBeenCalledOnce()
+    finish({ ok: true, json: async () => ({ nodes: [], title: '检查部署' }) })
+    await vi.waitFor(() => expect(w.document.getElementById('context-content')!.textContent).toContain('还没有'))
+  })
   it('keeps an embedded queued session visible and disables input until the same worker is allocated', async () => {
     const items = [task('task', null)], { w, streams } = await boot(items, '?task=task&session=1&embed=1')
     expect(w.document.documentElement.classList.contains('embedded-session')).toBe(true)
