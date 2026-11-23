@@ -9,6 +9,7 @@ import type { SourceContext } from './host.ts'
 import type { Runtime } from '../app/runtime.ts'
 import { HULY, HulyClient, hulyThreadUrl, readMarkup, type HulyDeployment, type HulyDoc } from './huly-client.ts'
 import { registerTeamPeppy } from '../team-peppy/http.ts'
+import { HulyRouting } from './huly-routing.ts'
 import { HulyFeedback, noteHulyReply } from './huly-feedback.ts'
 
 export const SOURCE = 'huly'
@@ -31,7 +32,8 @@ export function hulyTrigger(message: HulyDoc, deployment: HulyDeployment, channe
     at: new Date(message.modifiedOn).toISOString(), text: markup.text,
     url: hulyThreadUrl(deployment, channelId, root),
     channel: { source: SOURCE, thread, address: { workspace: deployment.workspace, channelId, rootId: root } },
-    meta: { workspace: deployment.workspace, channelId, rootId: root, messageId: message._id, edited: !!message.editedOn } }
+    meta: { workspace: deployment.workspace, channelId, rootId: root, messageId: message._id, edited: !!message.editedOn,
+      ...(!message.editedOn && markup.routes?.[deployment.botPerson] ? { peppyRoute: markup.routes[deployment.botPerson] } : {}) } }
 }
 export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): SourceKind<HulyConfig> {
   const d = client.deployment
@@ -40,7 +42,7 @@ export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): 
     schema: HulyConfig.extend({ workspace: z.literal(d.workspace).default(d.workspace), channels: z.array(z.string()).default(d.channels) }),
     fields: [],
     health: ['huly', 'hulyFeedback'],
-    scope: ({ meta }, config) => meta.workspace === config.workspace && config.channels.includes(String(meta.channelId))
+    scope: ({ meta }, config) => meta.routingError ? { listened: false, reason: 'huly_selection_invalid' } : meta.workspace === config.workspace && config.channels.includes(String(meta.channelId))
       ? { listened: true, observed: meta.observedThread === true, row: String(meta.channelId) } : { listened: false, reason: 'huly_channel_not_enabled' },
     channel: {
       allowed: (a, c) => a.workspace === c.workspace && c.channels.includes(a.channelId ?? ''),
@@ -50,7 +52,7 @@ export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): 
         const result = await client.reply(m.channel.address.rootId!, m.channel.address.channelId!, m.id, m.text)
         if (result === 'sent' && runtime) {
           // Match a native answer/ack receipt to its exact original input, not every message in the conversation.
-          for (const trigger of runtime.store.read.threadTriggers(`huly:${m.channel.thread}`, 100)) {
+          for (const trigger of (runtime.store.read.hulyThreadMessages?.(d.workspace, m.channel.address.channelId!, m.channel.address.rootId!, 1000) ?? runtime.store.read.threadTriggers(`huly:${m.channel.thread}`, 100))) {
             if (m.id === key('reply', trigger.id, m.text)) noteHulyReply(runtime, client, trigger)
           }
         }
@@ -73,7 +75,7 @@ export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): 
       fields: [], explicit: { zh: '允许的成员 @Team Peppy 发起工作。', en: 'Allowed members may mention Team Peppy.' } },
   }
 }
-export async function pollHuly(host: SourceContext, client: HulyClient, config: HulyConfig, received?: (trigger: Trigger) => void): Promise<number> {
+export async function pollHuly(host: SourceContext, client: HulyClient, config: HulyConfig, received?: (trigger: Trigger) => void, route?: (trigger: Trigger) => Promise<import('../core/index.ts').ReceiveResult>): Promise<number> {
   const d = client.deployment, k = cursorKey(d.workspace)
   const cursor = host.state.get(k)
   // Start at activation, never execute pre-existing mentions retroactively.
@@ -95,7 +97,7 @@ export async function pollHuly(host: SourceContext, client: HulyClient, config: 
         const edited = trigger.meta.edited === true
         if ((!edited && trigger.addressed) || followed) {
           trigger.meta.observedThread = true
-          const result = await host.receive(trigger)
+          const result = await (route ? route(trigger) : host.receive(trigger))
           if (result !== 'filtered') {
             host.state.set(watch, true)
             received?.(trigger)
@@ -107,13 +109,13 @@ export async function pollHuly(host: SourceContext, client: HulyClient, config: 
   }
   return rows.length
 }
-async function run(host: SourceContext, client: HulyClient, runtime: Runtime, signal: AbortSignal): Promise<void> {
+async function run(host: SourceContext, client: HulyClient, runtime: Runtime, signal: AbortSignal, routing: HulyRouting): Promise<void> {
   await host.ready
   const feedback = new HulyFeedback(host, client, runtime)
   while (!signal.aborted) {
     const cfg = host.config<HulyConfig>(SOURCE)
     if (host.configured() && cfg) {
-      try { await pollHuly(host, client, cfg, trigger => feedback.record(trigger)); host.report('huly', { state: 'ready', detail: 'Connected', at: new Date().toISOString() }) }
+      try { await pollHuly(host, client, cfg, trigger => feedback.record(trigger), trigger => routing.receive(trigger)); host.report('huly', { state: 'ready', detail: 'Connected', at: new Date().toISOString() }) }
       catch (error) { host.report('huly', { state: 'error', detail: `Huly poll failed; cursor retained: ${error instanceof Error ? error.message.slice(0, 200) : 'unknown error'}` }) }
       try { await feedback.sync(); host.report('hulyFeedback', { state: 'ready', detail: 'Message receipts synchronized' }) }
       catch { host.report('hulyFeedback', { state: 'error', detail: 'Message received; channel feedback will retry' }) }
@@ -131,9 +133,9 @@ export function deploymentFromEnv(): HulyDeployment {
 export const name = 'dsh-superagent-huly'
 export const inject = ['orchestrator', 'webServer', 'sessionController', 'agents']
 export function apply(ctx: Context): void {
-  const client = new HulyClient(deploymentFromEnv()), runtime = ctx.orchestrator as Runtime, kind = hulyKind(client, runtime)
+  const client = new HulyClient(deploymentFromEnv()), runtime = ctx.orchestrator as Runtime, kind = hulyKind(client, runtime), routing = new HulyRouting(runtime, client)
   ctx.effect(() => ctx.orchestrator.sources.register(kind))
-  ctx.effect(() => registerTeamPeppy(ctx, ctx.orchestrator as Runtime, client))
-  ctx.effect(() => { const stop = new AbortController(); const running = run(ctx.orchestrator.context(kind), client, runtime, stop.signal)
+  ctx.effect(() => registerTeamPeppy(ctx, ctx.orchestrator as Runtime, client, routing))
+  ctx.effect(() => { const stop = new AbortController(); const running = run(ctx.orchestrator.context(kind), client, runtime, stop.signal, routing)
     return async () => { stop.abort(); await running } })
 }

@@ -3,13 +3,13 @@ import { JSDOM } from 'jsdom'
 import { readFileSync } from 'node:fs'
 
 const windows: JSDOM[] = []
-afterEach(() => { windows.splice(0).forEach(w => w.window.close()) })
+afterEach(() => { windows.splice(0).forEach(w => { w.window.dispatchEvent(new w.window.Event('pagehide')); w.window.close() }) })
 async function boot(items: unknown[], query = '?task=task&session=1') {
   const dom = new JSDOM(readFileSync(new URL('../team-peppy-ui/index.html', import.meta.url), 'utf8'), { url: 'https://huly.example/files/ws/team-peppy/'+query, runScripts: 'outside-only' }); windows.push(dom)
   const streams: { url: string; close: ReturnType<typeof vi.fn>; onmessage?: (e: { data: string }) => void }[] = []
   class Events { close = vi.fn(); constructor(readonly url: string) { streams.push(this) } }
   const w = dom.window
-  Object.assign(w, { EventSource: Events, fetch: vi.fn(async (url: string) => ({ ok: true, json: async () => url.endsWith('status') ? { connected: true, workspaceUrl: 'pt' } : { items } })), setInterval: vi.fn() })
+  Object.assign(w, { EventSource: Events, fetch: vi.fn(async (url: string) => ({ ok: true, json: async () => url.endsWith('/context') ? { nodes: [], title: '检查部署' } : url.endsWith('status') ? { connected: true, workspaceUrl: 'pt' } : { items } })), setInterval: vi.fn() })
   w.eval(readFileSync(new URL('../team-peppy-ui/app.js', import.meta.url), 'utf8'))
   await vi.waitFor(() => expect(w.document.getElementById('connection')!.textContent).toBe('已连接 DSH'))
   return { w, streams }
@@ -23,9 +23,26 @@ describe('Huly reply-to-session navigation', () => {
     await vi.waitFor(() => expect(streams).toHaveLength(1))
     w.document.getElementById('refresh')!.click()
     await vi.waitFor(() => expect(w.fetch).toHaveBeenCalledTimes(4))
+    await new Promise(resolve => setTimeout(resolve, 0))
     expect(w.document.getElementById('session-panel')!.hidden).toBe(false)
     expect(streams[0]!.close).not.toHaveBeenCalled()
     expect(streams).toHaveLength(1)
+  })
+  it('switches the same cross-channel messages between relation branches and chronological threads', async () => {
+    const { w } = await boot([task()])
+    const nodes = [
+      { id: '1', threadKey: 'a:root', rootId: 'root', at: '2026-11-23T00:01:00Z', channelName: 'design', sender: 'Alice', text: '先讨论需求', inclusion: 'context' },
+      { id: '2', threadKey: 'b:root', rootId: 'root', at: '2026-11-23T00:02:00Z', channelName: 'engineering', sender: 'Bob', text: '接着修复登录', inclusion: 'adopted', sourceUrl: '/message/2' },
+    ]
+    w.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ nodes }) })) as never
+    w.document.getElementById('view-context')!.click()
+    await vi.waitFor(() => expect(w.document.querySelectorAll('.context-branch')).toHaveLength(2))
+    expect(w.document.querySelector('.context-destination')!.textContent).toContain('汇入同一任务')
+    w.document.getElementById('context-timeline')!.click()
+    expect([...w.document.querySelectorAll('.context-chronology .context-text')].map(n => n.textContent)).toEqual(['先讨论需求', '接着修复登录'])
+    expect(w.document.querySelector('a[href="/message/2"]')).not.toBeNull()
+    w.document.getElementById('view-worker')!.click()
+    expect(w.document.getElementById('composer')!.hidden).toBe(false)
   })
   it('keeps an embedded queued session visible and disables input until the same worker is allocated', async () => {
     const items = [task('task', null)], { w, streams } = await boot(items, '?task=task&session=1&embed=1')

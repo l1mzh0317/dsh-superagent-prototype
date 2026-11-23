@@ -38,6 +38,25 @@ describe('Message-header delivery state', () => {
     f.disposition.mockReturnValue({ fanout: ['task'], acked: ['task'] })
     expect(f.status()).toMatchObject({ state: 'running', sessionName: '检查部署' })
   })
+  it('retains a completed session entry only on its stable first message in a thread', () => {
+    const f = fixture(), first = { ...f.trigger, id: 'first', meta: { ...f.trigger.meta, messageId: 'first-message' } }
+    f.tickets.push({ id: 'task', title: '修复登录问题', origin: { triggerIds: ['first'] }, assignments: [{ startedAt: 'now' }], ended: { by: 'executor', outcome: 'completed', at: 'now' } } as unknown as Ticket)
+    Object.defineProperty(f.runtime.store, 'read', { value: { hulyThreadMessages: () => [first, f.trigger] } })
+    expect(f.status()).toMatchObject({ state: 'completed', sessionEntry: false, sessionName: null, taskId: null })
+    expect(hulyMessageStatus(f.runtime, 'ws', first)).toMatchObject({ state: 'completed', sessionEntry: true, sessionName: '修复登录问题', taskId: 'task' })
+  })
+  it('hides unresolved legacy intake but keeps current routing and explicit selection errors visible', () => {
+    const f = fixture()
+    f.values.set('huly-status-v2:ws', '2026-11-23T00:00:00Z'); f.trigger.at = '2026-11-22T00:00:00Z'
+    expect(f.status()).toBeUndefined()
+    f.trigger.at = '2026-11-23T01:00:00Z'; expect(f.status()).toMatchObject({ state: 'processing' })
+    f.trigger.meta.routingError = true; expect(f.status()).toMatchObject({ state: 'failed', label: expect.stringContaining('重新选择') })
+  })
+  it('offers completed discussion context without pretending a Router answer created a worker', () => {
+    const f = fixture(); f.trigger.text = 'Team Peppy 帮我解释一下'
+    f.values.set('huly-answered:ws:input', true)
+    expect(f.status()).toMatchObject({ state: 'completed', sessionName: '帮我解释一下', conversationId: 'm', sessionId: null })
+  })
   it('requests one substantive answer for an unanswered mention without sending a receipt', async () => {
     const f = fixture(), receipt = f.make(); receipt.record(f.trigger)
     f.disposition.mockReturnValue({ fanout: [], decisionId: 'ignore' })

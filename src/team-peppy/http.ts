@@ -9,7 +9,9 @@ import type { Runtime } from '../app/runtime.ts'
 import { key, UserError, ticketStage, type Ticket, type Trigger } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from '../sources/huly-client.ts'
-import { hulyInputState, hulyMessageStatus } from '../sources/huly-feedback.ts'
+import { contextView } from './context.ts'
+import { HulyRouting } from '../sources/huly-routing.ts'
+import { hulyInputState, hulyMessageStatus, statusCutover } from '../sources/huly-feedback.ts'
 
 const Send = z.object({ sessionId: z.string(), requestId: z.string().uuid(), text: z.string().trim().min(1).max(40_000), mode: z.literal('steer').default('steer') }).strict()
 const Cancel = z.object({ sessionId: z.string() }).strict()
@@ -57,8 +59,9 @@ export function publicStreamText(records: readonly unknown[] = []): string {
     return r.type === 'chunk' && r.chunk?.type === 'text-delta' && typeof r.chunk.text === 'string' ? [r.chunk.text] : []
   }).join('')
 }
-export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClient): () => void {
+export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClient, routing = new HulyRouting(runtime, huly)): () => void {
   const d = huly.deployment
+  if (!runtime.store.get(statusCutover(d.workspace))) runtime.store.set(statusCutover(d.workspace), new Date().toISOString())
   const allowedChannels = () => runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels ?? []
   const mayRead = async (ticket: Ticket, token: string) => {
     const channels = ticketChannels(ticket, d.workspace)
@@ -91,9 +94,23 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
       await runtime.ready
       const token = requestToken(req, d.workspace), account = await huly.account(token)
       if (req.method !== 'GET' && (!origin || req.headers['x-team-peppy-request'] !== '1')) throw new HulyError(403, 'Same-origin request required')
-      if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid }); return }
+      if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid, botPerson: d.botPerson }); return }
+      if (path === '/api/route' && req.method === 'POST') {
+        const value = z.object({ task: z.string().min(1).max(200) }).strict().parse(await body(req))
+        json(res, 200, await routing.issue(value.task, token, account)); return
+      }
+      const discussion = path.match(/^\/api\/conversations\/([^/]+)$/)
+      if (discussion && req.method === 'GET') {
+        const input = runtime.store.read.messageTriggers('huly', d.workspace, [decodeURIComponent(discussion[1]!)])[0]
+        const channel = input?.channel?.address.channelId
+        if (!input || !channel || !allowedChannels().includes(channel) || !await huly.one(HULY.channel, channel, token)) throw new HulyError(404, 'Conversation not found')
+        const context = await contextView(runtime, huly, token, undefined, input)
+        json(res, 200, { id: `conversation:${input.meta.messageId}`, title: context.title, sessionName: context.title,
+          sessionId: null, conversation: true, canWrite: false, state: { stage: 'ended' }, context }); return
+      }
       if (path === '/api/message-status' && req.method === 'GET') {
         const ids = z.array(z.string().min(1).max(200)).max(100).parse(url.searchParams.getAll('message'))
+        const anchors = new Map<string, string | undefined>()
         const seen = new Set<string>(), channels = new Map<string, boolean>(), items = []
         for (const trigger of runtime.store.read.messageTriggers('huly', d.workspace, [...new Set(ids)])) {
           const messageId = String(trigger.meta.messageId), channel = trigger.channel?.address.channelId
@@ -104,7 +121,7 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
           // A status must not disclose another channel's task name or a mixed-source worker.
           const linked = hulyInputState(runtime, d.workspace, trigger).tickets
           if ((await Promise.all(linked.map(t => mayRead(t, token)))).some(ok => !ok)) continue
-          const status = hulyMessageStatus(runtime, d.workspace, trigger)
+          const status = hulyMessageStatus(runtime, d.workspace, trigger, anchors)
           if (status) items.push(status)
         }
         json(res, 200, { workspace: d.workspace, items }); return
@@ -115,11 +132,12 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
         for (const row of rows) if (await mayRead(row, token)) visible.push(task(row, mayWrite(row, account)))
         json(res, 200, { items: visible.slice(0, 100) }); return
       }
-      const match = path.match(/^\/api\/tasks\/([^/]+)(?:\/(session|messages|cancel))?$/)
+      const match = path.match(/^\/api\/tasks\/([^/]+)(?:\/(session|messages|cancel|context))?$/)
       const ticket = match && runtime.store.tickets.get(decodeURIComponent(match[1]!))
       if (!ticket || !await mayRead(ticket, token)) throw new HulyError(404, 'Task not found')
       const shown = task(ticket, mayWrite(ticket, account))
       if (!match![2] && req.method === 'GET') { json(res, 200, shown); return }
+      if (match![2] === 'context' && req.method === 'GET') { json(res, 200, await contextView(runtime, huly, token, ticket)); return }
       if (!shown.sessionId) throw new HulyError(409, 'Worker session 尚未初始化')
       if (match![2] === 'session' && req.method === 'GET') {
         const stop = new AbortController(); const closed = () => stop.abort(); res.on('close', closed)

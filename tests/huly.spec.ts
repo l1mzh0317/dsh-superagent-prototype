@@ -35,6 +35,13 @@ describe('Huly Source', () => {
     expect(edited.id).not.toBe(hulyTrigger(message(), d, 'channel')!.id)
     expect(hulyTrigger(message({ modifiedOn: 3000 }), d, 'channel')!.id).toBe(hulyTrigger(message(), d, 'channel')!.id)
   })
+  it('carries optional routing only on an original typed bot mention, never on an edit or another person', () => {
+    const value = JSON.parse(mention); value.content[0].content[0].attrs.peppyRoute = 'opaque-choice'
+    expect(hulyTrigger(message({ message: JSON.stringify(value) }), d, 'channel')!.meta.peppyRoute).toBe('opaque-choice')
+    expect(hulyTrigger(message({ message: JSON.stringify(value), editedOn: 2000 }), d, 'channel')!.meta.peppyRoute).toBeUndefined()
+    value.content[0].content[0].attrs.id = 'another-person'
+    expect(hulyTrigger(message({ message: JSON.stringify(value) }), d, 'channel')!.meta.peppyRoute).toBeUndefined()
+  })
   it('observes only an explicitly invited thread, rather than its entire channel', () => {
     const source = hulyKind({ deployment: d } as HulyClient), trigger = hulyTrigger(message(), d, 'channel')!
     const config = { workspace: d.workspace, channels: d.channels, pollMs: 2000 }

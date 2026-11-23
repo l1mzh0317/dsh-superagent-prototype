@@ -16,6 +16,7 @@ async function fixture() {
     assignments: [{ id: 'assignment', createdAt: '2026-11-23', startedAt: '2026-11-23', state: 'running' }], inputs: [], undelivered: [], createdAt: '2026-11-23', updatedAt: '2026-11-23', origin: { triggerId: 'root', triggerIds: ['root'] } } as unknown as Ticket
   const huly = new HulyClient(deployment)
   const account = vi.spyOn(huly, 'account').mockResolvedValue({ uuid: 'owner', role: 'USER', socialIds: ['author-social'] })
+  vi.spyOn(huly, 'find').mockResolvedValue([])
   const channel = vi.spyOn(huly, 'one').mockResolvedValue({ _id: 'c' } as never)
   const prompt = vi.fn().mockResolvedValue({ accepted: true }), cancel = vi.fn().mockReturnValue({ accepted: true })
   const triggers = new Map<string, unknown>()
@@ -28,8 +29,9 @@ async function fixture() {
     } } } as unknown as Context
   const disposition = vi.fn(() => ({ fanout: [] as string[], acked: [] as string[] }))
   const messageTriggers = vi.fn(() => [{ id: 'input', human: true, addressed: 'mention', actor: { source: 'huly', id: 'author-social' }, meta: { workspace: 'a', messageId: 'message' }, channel: ticket.channels[0] }] as unknown as import('../src/core/index.ts').Trigger[])
+  const threadMessages = vi.fn(() => [] as import('../src/core/index.ts').Trigger[])
   const runtime = { ready: Promise.resolve(), configured: () => true, sources: { instance: () => ({ config: { channels: ['c'] } }) },
-    store: { get: () => undefined, read: { messageTriggers }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
+    store: { get: () => undefined, set: vi.fn(), read: { messageTriggers, hulyThreadMessages: threadMessages }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
       tickets: { list: () => [ticket], get: (id: string) => id === 'task' ? ticket : undefined } }, engine: { receive, attach }, passes: { request: vi.fn() } } as unknown as Runtime
   registerTeamPeppy(ctx, runtime, huly)
   const server = createServer((req, res) => { void handler(req, res) }); servers.push(server)
@@ -39,7 +41,7 @@ async function fixture() {
   const call = (path: string, data?: unknown, overrides = {}) => fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/team-peppy/api/${path}`, {
     headers: { ...headers, ...overrides }, ...(data ? { method: 'POST', body: JSON.stringify(data) } : {}),
   })
-  return { call, account, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition }
+  return { call, account, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages }
 }
 describe('Huly-authenticated worker bridge', () => {
   it('returns only message-header status and a real session binding after channel authorization', async () => {
@@ -57,6 +59,25 @@ describe('Huly-authenticated worker bridge', () => {
     f.disposition.mockReturnValue({ fanout: ['task'], acked: ['task'] })
     f.ticket.channels.push({ source: 'github', thread: 'private', address: {} } as never)
     expect((await (await f.call('message-status?message=message')).json()).items).toEqual([])
+  })
+  it('projects original thread context and refuses mixed-source task context', async () => {
+    const f = await fixture()
+    const base = { source: 'huly', human: true, actor: { source: 'huly', id: 'alice' }, at: '2026-11-23T00:00:00Z', meta: { workspace: 'a', channelId: 'c', rootId: 'root' } }
+    f.threadMessages.mockReturnValue([
+      { ...base, id: 'root', text: '先讨论需求', meta: { ...base.meta, messageId: 'root' } },
+      { ...base, at: '2026-11-23T00:01:00Z', id: 'next', text: '仅供参考', meta: { ...base.meta, messageId: 'next' } },
+    ] as never)
+    const res = await f.call('tasks/task/context'); expect(res.status).toBe(200)
+    const value = await res.json(); expect(value.nodes.map((n: { inclusion: string }) => n.inclusion)).toEqual(['adopted', 'context'])
+    expect(value.nodes[1].sourceUrl).toMatch(/message=next$/)
+    f.ticket.channels.push({ source: 'github', thread: 'private', address: {} } as never)
+    expect((await f.call('tasks/task/context')).status).toBe(404)
+  })
+  it('offers authenticated optional routing without leaking credentials into the grant', async () => {
+    const f = await fixture(); const res = await f.call('route', { task: 'task' })
+    expect(res.status).toBe(200); expect(Object.keys(await res.json()).sort()).toEqual(['expires', 'route'])
+    expect((await f.call('route', { task: 'missing' })).status).toBe(403)
+    expect((await f.call('route', { task: 'new' }, { origin: '' })).status).toBe(403)
   })
   it('submits to the existing worker Session and scopes idempotency by authenticated operator', async () => {
     const f = await fixture(), requestId = '25240cbb-a470-4623-818e-20cfbe564928'

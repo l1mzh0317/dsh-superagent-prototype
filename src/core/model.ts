@@ -30,6 +30,8 @@ export interface Trigger {
   human: boolean
   /** Source-declared: the sender addressed the agent, by mentioning it or in a direct message to it. */
   addressed?: 'mention' | 'direct'
+  /** Source-verified request to start separate work; the main Session may not attach it to an older ticket. */
+  newTicket?: true
   at: string
   text: string
   channel?: ChannelRef

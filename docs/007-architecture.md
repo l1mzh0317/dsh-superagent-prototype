@@ -370,6 +370,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/huly.ts` | Huly Source registration, message normalization and durable polling cursor |
 | `src/sources/huly-client.ts` | Huly REST transport, typed mentions and idempotent thread replies |
+| `src/sources/huly-routing.ts` | Short-lived authenticated mention choices with live permission revalidation and native task attachment |
+| `src/team-peppy/context.ts` | Read-only ticket/message context graph and chronological projection |
 | `src/sources/huly-feedback.ts` | Read-only message-header status derived from native task state and explicit-mention answer reminders |
 | `src/team-peppy/http.ts` | Huly-authenticated task views and original worker Session read, input and cancellation |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
@@ -415,6 +417,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/huly.spec.ts` | Huly mention normalization, cursor recovery, reply reconciliation and presentation boundaries |
 | `tests/huly-feedback.spec.ts` | Quiet native intake, status/session projection, substantive-answer reminders and footer-free replies |
 | `tests/huly-ui.spec.ts` | Reply deep links, queued session allocation and progress visibility in the real dashboard script |
+| `tests/huly-routing.spec.ts` | Optional member choices, original-task attachment, live permission revocation and forged-choice refusal |
 | `tests/huly-http.spec.ts` | Worker Session binding, authenticated inputs, channel access and CSRF |
 | `tests/huly-message-query.spec.ts` | Exact message/workspace scoping and preserving original human intake across later edits |
 | `tests/huly-mode.spec.ts` | Huly-only startup without a fabricated GitHub identity or credential helper |

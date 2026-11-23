@@ -10,6 +10,10 @@ export function storeReads(db: DatabaseSync) {
   messageTriggers: (source: string, workspace: string, ids: string[]): Trigger[] => ids.length ? values<Trigger>(
     `SELECT value FROM trigger WHERE json_extract(value, '$.source') = ? AND json_extract(value, '$.meta.workspace') = ?
       AND json_extract(value, '$.human') = 1 AND json_extract(value, '$.meta.messageId') IN (${ids.map(() => '?').join(',')}) ORDER BY rowid DESC`, source, workspace, ...ids) : [],
+  hulyThreadMessages: (workspace: string, channel: string, root: string, limit = 1000): Trigger[] => values<Trigger>(
+    `SELECT value FROM trigger WHERE json_extract(value, '$.source') = 'huly' AND json_extract(value, '$.meta.workspace') = ?
+      AND json_extract(value, '$.meta.channelId') = ? AND json_extract(value, '$.meta.rootId') = ?
+      AND json_extract(value, '$.meta.surface') IS NULL ORDER BY at ASC, rowid ASC LIMIT ?`, workspace, channel, root, limit),
   /** Newest first by arrival (`rowid`) order rather than trigger timestamp. */
   recentTriggers: (offset = 0, limit = 50): Trigger[] => db.prepare('SELECT value FROM trigger ORDER BY rowid DESC LIMIT ? OFFSET ?').all(limit, offset).map(row => JSON.parse(String(row.value)) as Trigger),
   /** Per-source trigger counts since `since`, plus the latest arrival timestamp across all time. */

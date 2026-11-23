@@ -72,6 +72,14 @@ function accepted(h: ReturnType<typeof harness>, id = '1', thread = 't1') {
 }
 
 describe('intake', () => {
+  it('keeps a source-verified new-session request from being attached to older work', () => {
+    const h = harness(), old = accepted(h).ticketId!
+    h.engine.receive(trigger('2', { newTicket: true, threads: [{ source: 'chat', id: 'selected:2' }] })); h.pump()
+    expect(() => h.engine.attach(old, '2')).toThrow(new UserError('newTicketRequested'))
+    const decision = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Separate work', scope: 'small', reason: 'explicit new session', acknowledgement: 'ok' })
+    expect(decision.ticketId).not.toBe(old)
+    expect(h.repo.tickets.get(old)!.inputs.some(i => i.kind === 'trigger' && i.triggerId === '2')).toBe(false)
+  })
   it('stores a trigger once and records source filtering', () => {
     const h = harness()
     expect(h.engine.receive(trigger('1'))).toBe('stored')

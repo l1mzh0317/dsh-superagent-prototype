@@ -12,6 +12,8 @@
     <section id="detail" class="detail" aria-label="任务详情"><div class="welcome"><span class="eyebrow">团队协作</span><h2>从任务进入工作现场</h2><p>选择任务，查看当前状态，或打开原有的 worker session 继续工作。</p></div></section>
     <aside id="session-panel" class="session" hidden aria-labelledby="session-title">
       <div class="session-header"><div><h2 id="session-title">Worker session</h2><span id="session-state" class="muted"></span></div><div class="session-actions"><button id="expand" class="icon-button" aria-label="展开会话">⤢</button><button id="close-session" class="icon-button" aria-label="收起会话">×</button></div></div>
+      <nav id="session-tabs" aria-label="会话视图"><button id="view-worker" type="button" aria-pressed="true">工作会话</button><button id="view-context" type="button" aria-pressed="false">上下文 <span id="context-count"></span></button></nav>
+      <section id="context-panel" hidden aria-label="关联消息上下文"><div class="context-toolbar"><span>关联消息</span><div role="group" aria-label="上下文展示方式"><button id="context-graph" type="button" aria-pressed="true">关系图</button><button id="context-timeline" type="button" aria-pressed="false">时间线</button></div></div><p id="context-feedback" role="status"></p><div id="context-content" tabindex="0"></div></section>
       <div id="session-activity" class="session-activity" role="status" aria-live="polite">正在连接 worker…</div>
       <div id="messages" class="messages" tabindex="0" aria-label="Worker 会话内容"></div>
       <div id="session-feedback" role="status" aria-live="polite"></div>

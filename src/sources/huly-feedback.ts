@@ -3,10 +3,11 @@ import type { Runtime } from '../app/runtime.ts'
 import { key, ticketStage, type Trigger } from '../core/index.ts'
 import { allowedSender } from '../policy.ts'
 import { workerSessionId } from '../executor/dsh.ts'
-import { family } from '../kv.ts'
+import { family, record } from '../kv.ts'
 import type { SourceContext } from './host.ts'
 import type { HulyClient } from './huly-client.ts'
 
+export const statusCutover = (workspace: string) => record<string>(`huly-status-v2:${workspace}`)
 interface Receipt { triggerId: string; done?: true; replyRequested?: true }
 const receiptKeys = (workspace: string) => family<Receipt>(`huly-feedback:${workspace}:`)
 const answeredKeys = (workspace: string) => family<boolean>(`huly-answered:${workspace}:`)
@@ -24,13 +25,29 @@ export function hulyInputState(runtime: Pick<Runtime, 'store'>, workspace: strin
   const adopted = answered || !!disposition?.acked?.length || decision?.kind === 'accept' || decision?.kind === 'reopen'
   return { decision, tickets, answered, adopted }
 }
-export function hulyMessageStatus(runtime: Pick<Runtime, 'store'>, workspace: string, trigger: Trigger) {
+export function hulyMessageStatus(runtime: Pick<Runtime, 'store'>, workspace: string, trigger: Trigger, anchors?: Map<string, string | undefined>) {
   if (!trigger.human || !trigger.channel || trigger.meta.surface === 'dashboard') return
   const { decision, tickets, answered, adopted } = hulyInputState(runtime, workspace, trigger)
   if (!trigger.addressed && !adopted) return
   const settings = runtime.store.settings(), ticket = tickets[0]
+  const cutover = runtime.store.get(statusCutover(workspace))
+  if (!ticket && !answered && cutover && trigger.at < cutover && !trigger.meta.routingError) return
+  const anchorKey = `${String(trigger.channel.address.channelId)}:${String(trigger.channel.address.rootId)}:${ticket?.id ?? 'discussion'}`
+  if (!anchors?.has(anchorKey)) {
+    const related = runtime.store.read?.hulyThreadMessages?.(workspace, String(trigger.meta.channelId ?? trigger.channel.address.channelId), String(trigger.meta.rootId ?? trigger.channel.address.rootId)) ?? [trigger]
+    const first = related.find(t => {
+      if (!t.human) return false
+      const state = hulyInputState(runtime, workspace, t)
+      return (t.addressed || state.adopted) && (ticket ? state.tickets.some(x => x.id === ticket.id) : state.answered && !state.tickets.length)
+    })
+    anchors ??= new Map()
+    anchors.set(anchorKey, first?.id)
+  }
+  const anchor = anchors.get(anchorKey)
+  const entry = !!(ticket || answered) && (!anchor || anchor === trigger.id)
   let state = 'queued', label = '排队中'
-  if (!allowedSender(settings, trigger.actor)) { state = 'blocked'; label = '未获得任务权限' }
+  if (trigger.meta.routingError) { state = 'failed'; label = '会话选择已失效，请重新选择后发送' }
+  else if (!allowedSender(settings, trigger.actor)) { state = 'blocked'; label = '未获得任务权限' }
   else if (ticket) {
     const stage = ticketStage(ticket)
     if (stage.stage === 'ended') {
@@ -45,8 +62,9 @@ export function hulyMessageStatus(runtime: Pick<Runtime, 'store'>, workspace: st
   else if (decision?.kind === 'unavailable') { state = 'failed'; label = '处理暂不可用' }
   else { state = 'processing'; label = '处理中' }
   if (settings.paused && !['completed', 'stopped', 'ended', 'blocked', 'failed'].includes(state)) { state = 'paused'; label = '已暂停' }
-  return { messageId: String(trigger.meta.messageId), state, label, taskId: ticket?.id ?? null,
-    sessionName: ticket?.title ?? null,
+  return { messageId: String(trigger.meta.messageId), state, label, taskId: entry ? ticket?.id ?? null : null,
+    conversationId: entry && !ticket ? String(trigger.meta.messageId) : null, sessionEntry: entry,
+    sessionName: entry ? (ticket?.title ?? (trigger.text?.replace(/@?Team\s*Peppy/ig, '').trim().slice(0, 80) || '频道讨论')) : null,
     sessionId: ticket?.assignments.some(a => a.startedAt) ? workerSessionId(ticket.id) : null, taskCount: tickets.length }
 }
 /** No reaction, status message or session footer is sent to the channel. */

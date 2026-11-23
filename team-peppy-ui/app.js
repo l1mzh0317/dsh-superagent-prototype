@@ -8,7 +8,8 @@ applyTheme(initial.get('theme'))
 window.addEventListener('message', event => {
   if (embedded && event.source === parent && event.origin === location.origin && event.data?.type === 'team-peppy:theme') applyTheme(event.data.theme)
 })
-let requestedTask = initial.get('task'), sessionRequested = initial.get('session') === '1'
+let requestedTask = initial.get('conversation') ? `conversation:${initial.get('conversation')}` : initial.get('task'), sessionRequested = initial.get('session') === '1'
+let sessionView = 'worker', contextMode = 'graph', contextTask, contextData, contextRequest = 0
 const drafts = new Map(), requests = new Map(), records = new Map()
 const labels = { working: '进行中', person: '待处理', idle: '等待消息', ended: '已结束' }
 const stateText = t => t.ended ? '已结束' : t.state.action === 'queued' ? '排队中' : labels[t.state.stage] || t.state.stage
@@ -23,7 +24,8 @@ function feedback(text) { $('session-feedback').textContent = text }
 function activity(text, phase = 'idle') { $('session-activity').textContent = text; $('session-activity').dataset.phase = phase }
 function locationForTask() {
   const url = new URL(location.href)
-  if (selected) url.searchParams.set('task', selected.id)
+  if (selected?.conversation) { url.searchParams.delete('task'); url.searchParams.set('conversation', selected.id.slice(13)) }
+  else if (selected) { url.searchParams.delete('conversation'); url.searchParams.set('task', selected.id) }
   if (sessionRequested) url.searchParams.set('session', '1'); else url.searchParams.delete('session')
   history.replaceState(null, '', url)
 }
@@ -64,10 +66,19 @@ function renderMessages() {
   if (nearBottom) target.scrollTop = target.scrollHeight
 }
 function openSession(t) {
+  if (contextTask !== t.id) { contextTask = t.id; contextData = undefined; contextRequest++; $('context-content').replaceChildren(); $('context-count').textContent = ''; setSessionView(t.conversation ? 'context' : 'worker'); void loadContext(t) }
+  if (t.conversation) {
+    generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''
+    sessionRequested = true; locationForTask(); $('session-panel').hidden = false; $('layout').classList.add('session-open')
+    $('session-title').textContent = t.title; $('session-state').textContent = '频道讨论'
+    $('view-worker').disabled = true; $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
+    setSessionView('context'); return
+  }
+  $('view-worker').disabled = false
   sessionRequested = true; locationForTask()
   if (!t.sessionId) {
     generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''; renderMessages()
-    $('session-panel').hidden = !embedded; $('layout').classList.toggle('session-open', embedded)
+    $('session-panel').hidden = false; $('layout').classList.add('session-open')
     $('session-title').textContent = t.sessionName || t.title; $('session-state').textContent = '等待创建 worker session'
     activity('排队中，等待分配 worker'); feedback('会话创建后会自动连接。')
     $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
@@ -98,7 +109,7 @@ async function refresh() {
   try {
     const result = await api('tasks'); tasks = result.items; $('connection').textContent = '已连接 DSH'
     if (requestedTask && !tasks.some(t => t.id === requestedTask)) {
-      try { const exact = await api(`tasks/${encodeURIComponent(requestedTask)}`); if (exact.id === requestedTask) tasks.push(exact) } catch {}
+      try { const exact = await api(requestedTask.startsWith('conversation:') ? `conversations/${encodeURIComponent(requestedTask.slice(13))}` : `tasks/${encodeURIComponent(requestedTask)}`); if (exact.id === requestedTask) tasks.push(exact) } catch {}
     }
     if (!selected && requestedTask) {
       const target = tasks.find(t => t.id === requestedTask)
@@ -109,18 +120,77 @@ async function refresh() {
       const current = tasks.find(t => t.id === selected.id)
       if (!current) { closeSession(); selected = undefined; $('detail').replaceChildren(element('p', 'empty', '任务已不可访问，请重新选择。')); if (embedded) showUnavailable('任务已不可访问，请重新选择。') }
       else { const changed = current.sessionId !== selected.sessionId; selected = current; detail(current); if (sessionRequested && (changed || !stream)) openSession(current)
+        if (sessionView === 'context') void loadContext(current)
         $('prompt').disabled = !current.sessionId || !current.canWrite; $('send').disabled = !current.sessionId || !current.canWrite || requests.get(current.sessionId)?.sending === true; $('cancel-turn').disabled = !current.sessionId || !current.canWrite }
     }
     renderList()
   } catch (error) { $('connection').textContent = error.message; if (error.status === 401 || error.status === 403) { closeSession(); tasks = []; selected = undefined; renderList(); $('task-list').replaceChildren(element('p', 'empty', '请先在当前浏览器登录 Huly 的 PT 工作区，再刷新此页。')); if (embedded) showUnavailable('请先登录对应的 Huly 工作区。') } }
 }
 function showUnavailable(text) {
+  contextRequest++; contextData = undefined; contextTask = undefined; $('context-content').replaceChildren(); setSessionView('worker')
   generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''
   $('session-panel').hidden = false; $('layout').classList.add('session-open')
   $('session-title').textContent = '会话暂不可用'; $('session-state').textContent = ''
   $('messages').replaceChildren(element('p', 'empty', text)); activity('未连接'); feedback('')
   $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
 }
+
+function setSessionView(view) {
+  sessionView = view
+  $('view-worker').setAttribute('aria-pressed', String(view === 'worker'))
+  $('view-context').setAttribute('aria-pressed', String(view === 'context'))
+  $('context-panel').hidden = view !== 'context'
+  for (const id of ['messages', 'session-activity', 'session-feedback', 'composer']) $(id).hidden = view !== 'worker'
+}
+async function loadContext(t) {
+  const own = ++contextRequest
+  if (!contextData) $('context-feedback').textContent = '正在读取关联消息…'
+  try {
+    const value = t.conversation ? (await api(`conversations/${encodeURIComponent(t.id.slice(13))}`)).context : await api(`tasks/${encodeURIComponent(t.id)}/context`)
+    if (own !== contextRequest || contextTask !== t.id) return
+    contextData = value; $('context-count').textContent = String(value.nodes.length); renderContext()
+  } catch (error) { if (own === contextRequest) { contextData = undefined; $('context-content').replaceChildren(); $('context-count').textContent = ''; $('context-feedback').textContent = error.message } }
+}
+const inclusionText = { adopted: '已采纳', included: '已送达', context: '仅供上下文', reply: '回复' }
+function contextMessage(n) {
+  const row = element('article', `context-message ${n.inclusion}`)
+  const head = element('div', 'context-meta')
+  head.append(element('strong', '', n.sender), element('time', '', new Date(n.at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })), element('span', 'inclusion', inclusionText[n.inclusion] || '仅供上下文'))
+  row.append(head, element('p', 'context-text', n.text))
+  const foot = element('div', 'context-meta')
+  foot.append(element('span', '', `# ${n.channelName}`))
+  if (n.mentioned) foot.append(element('span', '', '@Team Peppy'))
+  if (n.sourceUrl) { const link = element('a', '', '原消息 ↗'); link.href = n.sourceUrl; link.target = '_top'; foot.append(link) }
+  row.append(foot); return row
+}
+function renderContext() {
+  const root = $('context-content'); root.replaceChildren()
+  $('context-graph').setAttribute('aria-pressed', String(contextMode === 'graph'))
+  $('context-timeline').setAttribute('aria-pressed', String(contextMode === 'timeline'))
+  if (!contextData) return
+  $('context-feedback').textContent = contextData.truncated ? '较长线程已截取部分记录，可从原消息继续查看。' : '关系表示消息来源与任务归属；仅供上下文的消息不代表已执行。'
+  if (!contextData.nodes.length) { root.append(element('p', 'empty', '还没有可展示的关联消息。')); return }
+  if (contextMode === 'timeline') {
+    const list = element('div', 'context-chronology'); contextData.nodes.forEach(n => list.append(contextMessage(n))); root.append(list)
+  } else {
+    const branches = element('div', 'context-branches'), groups = new Map()
+    for (const n of contextData.nodes) { if (!groups.has(n.threadKey)) groups.set(n.threadKey, []); groups.get(n.threadKey).push(n) }
+    let lane = 0
+    for (const nodes of groups.values()) {
+      const branch = element('section', 'context-branch'); branch.dataset.lane = String(lane++ % 4)
+      const title = element('h3', 'context-source', `# ${nodes[0].channelName}`)
+      title.append(element('span', '', nodes[0].threadKey === 'dashboard' ? '直接接手' : `线程 ${nodes[0].rootId.slice(0, 6)}…`))
+      branch.append(title); nodes.forEach(n => branch.append(contextMessage(n))); branches.append(branch)
+    }
+    root.append(branches)
+    const destination = element('div', 'context-destination'); destination.append(element('span', 'muted', selected?.conversation ? '讨论上下文' : '汇入同一任务'), element('strong', '', selected?.title || contextData.title)); root.append(destination)
+  }
+}
+$('view-worker').onclick = () => setSessionView('worker')
+$('view-context').onclick = () => { setSessionView('context'); if (selected) void loadContext(selected) }
+$('context-graph').onclick = () => { contextMode = 'graph'; renderContext() }
+$('context-timeline').onclick = () => { contextMode = 'timeline'; renderContext() }
+
 $('search').oninput = renderList
 $('filters').onclick = e => { const b = e.target.closest('[data-filter]'); if (!b) return; filter = b.dataset.filter; [...$('filters').children].forEach(x => x.setAttribute('aria-pressed', String(x === b))); renderList() }
 $('refresh').onclick = refresh
