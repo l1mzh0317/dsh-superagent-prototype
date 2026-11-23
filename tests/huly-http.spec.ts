@@ -20,6 +20,7 @@ async function fixture() {
   const huly = new HulyClient(deployment)
   const account = vi.spyOn(huly, 'account').mockResolvedValue({ uuid: 'owner', role: 'USER', socialIds: ['author-social'] })
   const directory = vi.spyOn(huly, 'find').mockResolvedValue([])
+  const workspaceMembers = vi.spyOn(huly, 'workspaceMembers').mockResolvedValue([])
   const channel = vi.spyOn(huly, 'one').mockResolvedValue({ _id: 'c' } as never)
   const prompt = vi.fn().mockResolvedValue({ accepted: true }), cancel = vi.fn().mockReturnValue({ accepted: true })
   const triggers = new Map<string, unknown>()
@@ -46,7 +47,7 @@ async function fixture() {
   const call = (path: string, data?: unknown, overrides = {}) => fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/team-peppy/api/${path}`, {
     headers: { ...headers, ...overrides }, ...(data ? { method: 'POST', body: JSON.stringify(data) } : {}),
   })
-  return { call, account, directory, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages, discussionRoots, triggers }
+  return { call, account, directory, workspaceMembers, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages, discussionRoots, triggers }
 }
 describe('Huly-authenticated worker bridge', () => {
   it('returns only message-header status and a real session binding after channel authorization', async () => {
@@ -208,6 +209,102 @@ describe('workspace Instances', () => {
     expect((await f.call(query)).status).toBe(404)
     identity('owner', 'OWNER')
     expect(await (await f.call('instances/grant-state', { grantId, action: 'confirm-revoked' })).json()).toEqual({ state: 'revoked' })
+  })
+
+  it('accepts services with no note and preserves service names from older Pepper releases as notes', async () => {
+    const { call, account } = await fixture()
+    account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: ['owner'] })
+    const service = { protocol: 'https', port: 443 }
+    const machine = { name: 'Build server', address: '100.70.0.9', service }
+    const created = await call('instances/machines', machine)
+    expect(created.status).toBe(200)
+    const { id: machineId } = await created.json()
+    expect((await (await call('instances/machines', { ...machine, service: { ...service, note: '' } })).json()).id).toBe(machineId)
+    const legacy = { name: 'Build logs', protocol: 'http', port: 8443 }
+    expect((await call('instances/services', { machineId, service: legacy })).status).toBe(200)
+    expect((await call('instances/services', { machineId, service: { protocol: 'http', port: 8443, note: 'Build logs' } })).status).toBe(200)
+    const { machines } = await (await call('instances')).json()
+    expect(machines[0].services).toEqual([
+      expect.objectContaining({ protocol: 'https', port: 443, name: 'HTTPS :443', note: '' }),
+      expect.objectContaining({ protocol: 'http', port: 8443, name: 'Build logs', note: 'Build logs' }),
+    ])
+  })
+
+  it('delegates Instances to current members without granting control of the delegation list', async () => {
+    const f = await fixture()
+    const delegate = 'b285cc14-058b-4b6b-9546-cde778c55cf8'
+    const absent = '52693805-676a-438f-b689-dce92ae4aa96'
+    const identity = (uuid: string, role: string) => f.account.mockResolvedValue({ uuid, role, socialIds: [uuid + '-social'] })
+    const machine = { name: 'Build server', address: '100.70.0.9', service: { name: 'Build logs', protocol: 'https', port: 8443 } }
+    const change = { account: delegate, enabled: true }
+
+    f.workspaceMembers.mockResolvedValue([{ person: delegate, role: 'USER' }])
+    // An active Employee row alone is insufficient if someone has left the workspace.
+    f.directory.mockResolvedValue([
+      { personUuid: delegate, name: 'Member' }, { personUuid: absent, name: 'Former member' },
+    ] as never)
+    identity(delegate, 'USER')
+    expect((await f.call('instances/managers')).status).toBe(403)
+    expect((await f.call('instances/managers', change)).status).toBe(403)
+    expect((await f.call('instances/machines', machine)).status).toBe(403)
+    identity(delegate, 'MAINTAINER')
+    expect((await f.call('instances/managers', change)).status).toBe(403)
+
+    identity('owner', 'OWNER')
+    expect(await (await f.call('instances/managers')).json()).toMatchObject({ managers: [] })
+    expect((await f.call('instances/managers', { account: absent, enabled: true })).status).toBe(400)
+    expect((await f.call('instances/managers', change, { origin: 'https://foreign.test' })).status).toBe(403)
+    expect(await (await f.call('instances/managers', change)).json()).toMatchObject({ managers: [delegate] })
+    expect(await (await f.call('instances/managers', change)).json()).toMatchObject({ managers: [delegate] })
+
+    identity(delegate, 'USER')
+    expect((await (await f.call('instances')).json()).admin).toBe(true)
+    expect((await f.call('instances/machines', machine)).status).toBe(200)
+    expect((await f.call('instances/managers')).status).toBe(403)
+    expect((await f.call('instances/managers', { account: absent, enabled: true })).status).toBe(403)
+
+    f.workspaceMembers.mockResolvedValue([])
+    expect((await (await f.call('instances')).json()).admin).toBe(false)
+    expect((await f.call('instances/machines', machine)).status).toBe(403)
+    f.workspaceMembers.mockResolvedValue([{ person: delegate, role: 'USER' }])
+    identity('owner', 'OWNER')
+    expect(await (await f.call('instances/managers', { ...change, enabled: false })).json()).toMatchObject({ managers: [] })
+    identity(delegate, 'USER')
+    expect(await (await f.call('instances')).json()).toEqual({ admin: false, machines: [], grants: [] })
+    expect((await f.call('instances/machines', machine)).status).toBe(403)
+  })
+
+  it('rejects a delegated write if the owner revokes permission during member validation', async () => {
+    const f = await fixture()
+    const delegate = 'f7079ad5-9e15-4a5b-acf7-80d7fc316083'
+    const recipient = 'ffb31a7f-bd99-4079-bde0-33bffd369c79'
+    const auth = (uuid: string, role: string) => f.account.mockResolvedValue({ uuid, role, socialIds: [uuid + '-social'] })
+    auth('owner', 'OWNER')
+    f.workspaceMembers.mockResolvedValue([{ person: delegate, role: 'USER' }])
+    let validationEntered: () => void
+    let completeValidation: () => void
+    const validating = new Promise<void>(resolve => { validationEntered = resolve })
+    const completion = new Promise<void>(resolve => { completeValidation = resolve })
+    f.directory.mockImplementation(async (_class, condition) => {
+      const selected = (condition.personUuid as { $in: string[] }).$in
+      if (selected.includes(recipient)) {
+        validationEntered()
+        await completion
+      }
+      return selected.map(personUuid => ({ personUuid, name: 'Member' })) as never
+    })
+    expect((await f.call('instances/managers', { account: delegate, enabled: true })).status).toBe(200)
+    await f.call('instances/machines', { name: 'Build server', address: '100.72.0.9', service: { name: 'Logs', protocol: 'https', port: 443 } })
+    const serviceId = (await (await f.call('instances')).json()).machines[0].services[0].id
+    auth(delegate, 'USER')
+    const pending = f.call('instances/grants', { serviceId, members: [{ account: recipient, login: 'test@example.test' }] })
+    try {
+      await validating
+      auth('owner', 'OWNER')
+      expect((await f.call('instances/managers', { account: delegate, enabled: false })).status).toBe(200)
+    } finally { completeValidation!() }
+    expect((await pending).status).toBe(403)
+    expect((await (await f.call('instances')).json()).grants).toEqual([])
   })
 
   it('sends the registered endpoint to the host probe over the private socket', async () => {

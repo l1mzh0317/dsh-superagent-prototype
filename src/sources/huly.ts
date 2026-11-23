@@ -126,7 +126,7 @@ async function run(host: SourceContext, client: HulyClient, runtime: Runtime, si
 export function deploymentFromEnv(): HulyDeployment {
   const required = (name: string) => { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
   return { workspace: required('HULY_WORKSPACE_ID'), workspaceUrl: required('HULY_WORKSPACE_URL'), origin: required('HULY_ORIGIN'),
-    endpoint: required('HULY_TRANSACTOR_URL'), tokenFile: required('HULY_TOKEN_FILE'), botPerson: required('HULY_BOT_PERSON'),
+    accountsEndpoint: process.env.HULY_ACCOUNTS_URL, endpoint: required('HULY_TRANSACTOR_URL'), tokenFile: required('HULY_TOKEN_FILE'), botPerson: required('HULY_BOT_PERSON'),
     botSocial: required('HULY_BOT_SOCIAL'), botAccount: required('HULY_BOT_ACCOUNT'),
     channels: JSON.parse(required('HULY_CHANNELS')) as string[], operators: JSON.parse(required('HULY_OPERATORS')) as string[] }
 }

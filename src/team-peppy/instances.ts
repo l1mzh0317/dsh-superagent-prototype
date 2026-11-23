@@ -19,7 +19,15 @@ const isTailnetIP = (value: string): boolean => {
 const address = z.string().trim().toLowerCase().refine(isTailnetIP, '请输入 Tailscale IP 地址')
   // Canonicalize IPv6 so equivalent spellings also deduplicate.
   .transform(ip => isIP(ip) === 6 ? new URL(`http://[${ip}]`).hostname.slice(1, -1) : ip)
-const serviceInput = z.object({ name: label, protocol: z.enum(['https', 'http', 'ssh']), port: z.number().int().min(1).max(65535) }).strict()
+const serviceInput = z.object({
+  name: label.optional(),
+  note: z.string().trim().max(160).optional(),
+  protocol: z.enum(['https', 'http', 'ssh']),
+  port: z.number().int().min(1).max(65535),
+}).strict()
+const serviceNote = (service: z.infer<typeof serviceInput>): string => service.note ?? service.name ?? ''
+const sameService = (first: z.infer<typeof serviceInput>, second: z.infer<typeof serviceInput>): boolean =>
+  first.port === second.port && first.protocol === second.protocol && serviceNote(first) === serviceNote(second)
 const machineInput = z.object({ name: label, address, service: serviceInput }).strict()
 const grantInput = z.object({
   serviceId: id,
@@ -32,9 +40,10 @@ type GrantState = 'pending' | 'applied' | 'revoking' | 'revoked'
 type Grant = z.infer<typeof grantInput> & {
   id: string; state: GrantState; updatedAt: string; updatedBy: string
 }
-interface Registry { machines: Machine[]; grants: Grant[] }
+interface Registry { machines: Machine[]; grants: Grant[]; managers?: string[] }
 const registryKey = family<Registry>('huly-instances:')
-const admins = new Set(['OWNER', 'ADMIN'])
+const workspaceAdmins = new Set(['OWNER', 'ADMIN'])
+const delegatedRoles = new Set(['MAINTAINER', 'USER'])
 const members = new Set(['OWNER', 'ADMIN', 'MAINTAINER', 'USER'])
 const employeeClass = 'contact:mixin:Employee'
 
@@ -102,7 +111,7 @@ export class Instances {
   private addService(machine: Machine, input: z.infer<typeof serviceInput>): void {
     const existing = machine.services.find(s => s.port === input.port)
     if (existing) {
-      if (existing.name === input.name && existing.protocol === input.protocol) return
+      if (sameService(existing, input)) return
       throw new HulyError(409, '这个端口上已登记服务')
     }
     if (machine.services.length >= 30) throw new HulyError(409, '这台机器的服务数量已达上限')
@@ -122,16 +131,47 @@ export class Instances {
       row.personUuid !== this.huly.deployment.botAccount ? [{ account: row.personUuid, name: row.name }] : [])
   }
 
+  private async eligibleManager(account: string, token: string): Promise<boolean> {
+    if (account === this.huly.deployment.botAccount) return false
+    const [members, employees] = await Promise.all([this.huly.workspaceMembers(token), this.directory(token, [account])])
+    return members.some(member => member.person === account && delegatedRoles.has(member.role)) &&
+      employees.some(employee => employee.account === account)
+  }
+
+  private async manageDelegation(method: string | undefined, readBody: () => Promise<unknown>, token: string) {
+    const botAccount = this.huly.deployment.botAccount
+    if (method === 'GET') return { managers: this.read().managers ?? [], botAccount }
+    if (method !== 'POST') throw new HulyError(404, 'Unknown Instances operation')
+    const { account, enabled } = z.object({ account: id, enabled: z.boolean() }).strict().parse(await readBody())
+    if (enabled && !await this.eligibleManager(account, token)) throw new HulyError(400, '请选择当前工作区的成员或维护者')
+    return this.update(current => {
+      const managers = new Set(current.managers)
+      if (enabled) managers.add(account)
+      else managers.delete(account)
+      current.managers = [...managers]
+      return { managers: current.managers, botAccount }
+    })
+  }
+
   async handle(operation: string, method: string | undefined, query: URLSearchParams, readBody: () => Promise<unknown>, token: string, account: HulyAccount): Promise<unknown> {
     if (!members.has(account.role)) throw new HulyError(403, 'Instances 仅对工作区成员开放')
-    const admin = admins.has(account.role)
+    const workspaceAdmin = workspaceAdmins.has(account.role)
+    if (operation === 'managers') {
+      if (!workspaceAdmin) throw new HulyError(403, '只有工作区所有者或管理员可以分配 Instances 管理权限')
+      return this.manageDelegation(method, readBody, token)
+    }
+    const delegated = !workspaceAdmin && this.read().managers?.includes(account.uuid) === true &&
+      await this.eligibleManager(account.uuid, token)
     const registry = this.read()
+    const admin = workspaceAdmin || (delegated && registry.managers?.includes(account.uuid) === true)
 
     if (method === 'GET' && operation === '') {
       const machines = registry.machines.flatMap(machine => {
         const services = machine.services.flatMap(service => {
           const logins = this.logins(registry, account, service.id)
-          return admin || logins.length ? [{ ...service, logins }] : []
+          const note = serviceNote(service)
+          const name = note || `${service.protocol.toUpperCase()} :${service.port}`
+          return admin || logins.length ? [{ ...service, name, note, logins }] : []
         })
         return admin || services.length ? [{ ...machine, services }] : []
       })
@@ -144,19 +184,23 @@ export class Instances {
       const { machine, service } = this.service(registry, serviceId)
       return { workspaceUrl: this.huly.deployment.workspaceUrl, address: machine.address, port: service.port, protocol: service.protocol, logins }
     }
-    if (!admin) throw new HulyError(403, '需要 Huly 工作区管理员权限')
+    if (!admin) throw new HulyError(403, '需要 Instances 管理权限')
     if (method === 'GET' && operation === 'members') return { members: await this.directory(token) }
     if (method !== 'POST') throw new HulyError(404, 'Unknown Instances operation')
 
+    const updateManaged = <T>(apply: (current: Registry) => T): T => this.update(current => {
+      // A grant could be withdrawn while an already authorized request reads its body or validates members.
+      if (!workspaceAdmin && !current.managers?.includes(account.uuid)) throw new HulyError(403, 'Instances 管理权限已撤销')
+      return apply(current)
+    })
     const data = await readBody()
     switch (operation) {
       case 'machines': {
         const value = machineInput.parse(data)
-        return this.update(current => {
+        return updateManaged(current => {
           const existing = current.machines.find(m => m.address === value.address)
           if (existing) {
-            if (existing.name === value.name && existing.services.some(s => s.port === value.service.port &&
-              s.name === value.service.name && s.protocol === value.service.protocol)) return { id: existing.id }
+            if (existing.name === value.name && existing.services.some(service => sameService(service, value.service))) return { id: existing.id }
             throw new HulyError(409, '这个 Tailscale IP 已登记')
           }
           if (current.machines.length >= 100) throw new HulyError(409, '工作区机器数量已达上限')
@@ -168,7 +212,7 @@ export class Instances {
       }
       case 'services': {
         const value = z.object({ machineId: id, service: serviceInput }).strict().parse(data)
-        return this.update(current => {
+        return updateManaged(current => {
           const machine = current.machines.find(m => m.id === value.machineId)
           if (!machine) throw new HulyError(404, '机器不存在')
           this.addService(machine, value.service)
@@ -197,7 +241,7 @@ export class Instances {
         if (!accounts.every(accountId => people.some(person => person.account === accountId))) throw new HulyError(400, '请选择当前工作区的有效成员')
         const preview = policy(value, machine.address, service.port)
         if (operation === 'preview') return preview
-        return this.update(current => {
+        return updateManaged(current => {
           const existing = current.grants.filter(grant => grant.serviceId === value.serviceId && grant.state !== 'revoked')
           for (const grant of existing) {
             const overlap = grant.members.some(entry => value.members.some(member => entry.account === member.account || entry.login === member.login))
@@ -223,7 +267,7 @@ export class Instances {
       }
       case 'grant-state': {
         const value = z.object({ grantId: id, action: z.enum(['confirm', 'revoke', 'confirm-revoked', 'discard']) }).strict().parse(data)
-        return this.update(current => {
+        return updateManaged(current => {
           const grant = current.grants.find(g => g.id === value.grantId)
           if (!grant) throw new HulyError(404, '授权不存在')
           const transitions = { confirm: ['pending', 'applied'], revoke: ['applied', 'revoking'], 'confirm-revoked': ['revoking', 'revoked'], discard: ['pending', 'revoked'] } as const

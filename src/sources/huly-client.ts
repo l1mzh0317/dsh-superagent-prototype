@@ -11,8 +11,10 @@ export interface HulyDoc {
   [name: string]: unknown
 }
 export interface HulyAccount { uuid: string; role: string; socialIds: string[] }
+export interface HulyWorkspaceMember { person: string; role: string }
 export interface HulyDeployment {
   workspace: string; workspaceUrl: string; origin: string; endpoint: string; tokenFile: string
+  accountsEndpoint?: string
   botPerson: string; botSocial: string; botAccount: string; channels: string[]; operators: string[]
 }
 /** Expected transport or authorization failure safe to return without upstream response bodies. */
@@ -50,6 +52,20 @@ export class HulyClient {
     const a = await this.api('account', token) as HulyAccount
     if (!a.uuid || !Array.isArray(a.socialIds) || !a.socialIds.length) throw new HulyError(401, 'Huly login required')
     return a
+  }
+  async workspaceMembers(token: string): Promise<HulyWorkspaceMember[]> {
+    const url = this.deployment.accountsEndpoint || new URL('/_accounts', this.deployment.origin)
+    const res = await this.request(url, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ method: 'getWorkspaceMembers', params: {} }), redirect: 'error', signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) throw new HulyError(502, '暂时无法读取 Huly 工作区成员')
+    const { result, error } = await res.json() as { result?: unknown; error?: unknown }
+    if (error || !Array.isArray(result) ||
+      !result.every(row => typeof row?.person === 'string' && typeof row?.role === 'string')) {
+      throw new HulyError(502, '暂时无法读取 Huly 工作区成员')
+    }
+    return result as HulyWorkspaceMember[]
   }
   threadUrl(channel: string, root: string): string {
     return hulyThreadUrl(this.deployment, channel, root)
