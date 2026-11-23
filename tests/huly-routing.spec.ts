@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { Runtime } from '../src/app/runtime.ts'
 import type { Trigger, Ticket } from '../src/core/index.ts'
-import { HulyClient } from '../src/sources/huly-client.ts'
+import { HulyClient, HulyError } from '../src/sources/huly-client.ts'
 import { HulyRouting } from '../src/sources/huly-routing.ts'
 function fixture() {
   const client = new HulyClient({ workspace: 'ws', workspaceUrl: 'pt', origin: '', endpoint: '', tokenFile: '', botPerson: '', botSocial: '', botAccount: '', channels: ['c'], operators: [] })
@@ -28,6 +28,12 @@ describe('Optional Huly mention routing', () => {
     await f.routing.receive(f.input)
     expect(f.attach).not.toHaveBeenCalled(); expect(f.receive).toHaveBeenCalledWith(expect.objectContaining({ meta: expect.objectContaining({ routingError: true }) }))
     f.input.meta.peppyRoute = 'forged'; await f.routing.receive(f.input); expect(f.attach).not.toHaveBeenCalled()
+  })
+  it('retains intake for retry during a temporary Huly outage', async () => {
+    const f = fixture(); f.input.meta.peppyRoute = (await f.routing.issue('ticket', 'user-token', f.account)).route
+    vi.mocked(f.client.account).mockRejectedValue(new HulyError(502, 'temporarily unavailable'))
+    await expect(f.routing.receive(f.input)).rejects.toMatchObject({ status: 502 })
+    expect(f.receive).not.toHaveBeenCalled(); expect(f.attach).not.toHaveBeenCalled()
   })
   it('binds choices to their author and marks verified new-work intent without creating a second executor', async () => {
     const f = fixture(); const grant = await f.routing.issue('new', 'user-token', f.account)

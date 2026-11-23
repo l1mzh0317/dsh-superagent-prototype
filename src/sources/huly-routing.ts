@@ -1,7 +1,7 @@
 /** Optional, authenticated mention routing. Grants live briefly in memory; credentials never enter message markup. */
 import { randomUUID } from 'node:crypto'
 import type { Runtime } from '../app/runtime.ts'
-import { type Ticket, type Trigger, type ReceiveResult } from '../core/index.ts'
+import { type Ticket, type Trigger, type ReceiveResult, UserError } from '../core/index.ts'
 import { allowedSender } from '../policy.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from './huly-client.ts'
 
@@ -41,11 +41,11 @@ export class HulyRouting {
     this.prune()
     const grant = typeof route === 'string' ? this.grants.get(route) : undefined
     try {
-      if (!grant || !grant.actors.includes(trigger.actor.id) || !allowedSender(this.runtime.store.settings(), trigger.actor)) throw new Error('Expired selection')
+      if (!grant || !grant.actors.includes(trigger.actor.id) || !allowedSender(this.runtime.store.settings(), trigger.actor)) throw new HulyError(409, 'Expired selection')
       const account = await this.client.account(grant.token)
-      if (account.uuid !== grant.account || !account.socialIds.includes(trigger.actor.id) || !await this.client.one(HULY.channel, String(trigger.meta.channelId), grant.token)) throw new Error('Membership changed')
+      if (account.uuid !== grant.account || !account.socialIds.includes(trigger.actor.id) || !await this.client.one(HULY.channel, String(trigger.meta.channelId), grant.token)) throw new HulyError(403, 'Membership changed')
       const ticket = grant.task === 'new' ? undefined : this.runtime.store.tickets.get(grant.task)
-      if (grant.task !== 'new' && (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, grant.token) || !mayWriteHulyTask(this.client, ticket, account))) throw new Error('Task access changed')
+      if (grant.task !== 'new' && (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, grant.token) || !mayWriteHulyTask(this.client, ticket, account))) throw new HulyError(403, 'Task access changed')
       // A private evaluation lane prevents subscription fan-out before a manual choice is attached.
       // Original Huly thread identity remains in channel/meta for context, replies and source links.
       const routed: Trigger = { ...trigger, threads: [{ source: 'huly', id: `selected:${trigger.id}` }],
@@ -57,7 +57,8 @@ export class HulyRouting {
       })
       this.runtime.passes.request()
       return result
-    } catch {
+    } catch (error) {
+      if (!(error instanceof UserError) && (!(error instanceof HulyError) || ![401, 403, 404, 409].includes(error.status))) throw error
       // Never fall back to auto routing after an explicit choice expires or loses permission.
       return this.runtime.receive({ ...trigger, meta: { ...trigger.meta, peppyRoute: undefined, routingError: true } })
     }
