@@ -90,6 +90,9 @@ describe('intake', () => {
     expect(h.repo.triggers.disposition('4')!.fanout).toContain(second)
     expect(h.repo.tickets.get(first)!.inputs.some(i => i.kind === 'trigger' && i.triggerId === '3')).toBe(false)
     h.engine.receive(trigger('5', { targetTicket: second }))
+    expect(h.repo.triggers.disposition('5')!.fanout).toEqual([])
+    expect(() => h.engine.decide('5', { kind: 'accept', title: 'Wrong session', scope: 'small', reason: 'wrong target', acknowledgement: '' })).toThrow(new UserError('sessionTargetMismatch'))
+    h.engine.attach(second, '5')
     expect(h.repo.triggers.disposition('5')!.fanout).toEqual([second])
   })
   it('stores a trigger once and records source filtering', () => {

@@ -304,6 +304,7 @@ export class Evals extends EnginePart {
   }
   /** Record an accept with the Mandate the Eval gives, and have Tickets create its ticket. */
   private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Decision {
+    if (evaluation.triggerIds.some(id => this.repo.triggers.get(id)?.targetTicket)) throw new UserError('sessionTargetMismatch')
     const at = this.now()
     const basis = { ...evaluation.basis, ...(outcome.rules ? { rules: outcome.rules } : {}) }
     const { strength, policyVersion, actor } = evaluation
