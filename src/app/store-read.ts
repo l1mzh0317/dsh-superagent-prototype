@@ -6,6 +6,10 @@ import type { Dropped, Receipt, TimelinePlace } from './store.ts'
 export function storeReads(db: DatabaseSync) {
   const values = <T>(sql: string, ...parameters: SQLInputValue[]): T[] => db.prepare(sql).all(...parameters).map(row => JSON.parse(String(row.value)) as T)
   return {
+  /** Exact visible-message projection; edited copies cannot replace an original human intake. */
+  messageTriggers: (source: string, workspace: string, ids: string[]): Trigger[] => ids.length ? values<Trigger>(
+    `SELECT value FROM trigger WHERE json_extract(value, '$.source') = ? AND json_extract(value, '$.meta.workspace') = ?
+      AND json_extract(value, '$.human') = 1 AND json_extract(value, '$.meta.messageId') IN (${ids.map(() => '?').join(',')}) ORDER BY rowid DESC`, source, workspace, ...ids) : [],
   /** Newest first by arrival (`rowid`) order rather than trigger timestamp. */
   recentTriggers: (offset = 0, limit = 50): Trigger[] => db.prepare('SELECT value FROM trigger ORDER BY rowid DESC LIMIT ? OFFSET ?').all(limit, offset).map(row => JSON.parse(String(row.value)) as Trigger),
   /** Per-source trigger counts since `since`, plus the latest arrival timestamp across all time. */

@@ -16,6 +16,21 @@ async function boot(items: unknown[], query = '?task=task&session=1') {
 }
 const task = (id = 'task', sessionId: string | null = 'worker-task') => ({ id, title: '检查部署', sessionName: '检查部署', sessionId, sessionStatus: 'running', createdAt: '2026-11-23', state: { stage: 'working' }, canWrite: true })
 describe('Huly reply-to-session navigation', () => {
+  it('keeps an embedded queued session visible and disables input until the same worker is allocated', async () => {
+    const items = [task('task', null)], { w, streams } = await boot(items, '?task=task&session=1&embed=1')
+    expect(w.document.documentElement.classList.contains('embedded-session')).toBe(true)
+    expect(w.document.getElementById('session-panel')!.hidden).toBe(false)
+    expect(w.document.getElementById('session-activity')!.textContent).toContain('排队中')
+    expect((w.document.getElementById('send') as HTMLButtonElement).disabled).toBe(true)
+    items[0] = task(); w.document.getElementById('refresh')!.click()
+    await vi.waitFor(() => expect(streams).toHaveLength(1))
+    expect(streams[0]!.url).toContain('/task/session')
+  })
+  it('shows an explicit unavailable state in an embedded panel instead of opening another session', async () => {
+    const { w, streams } = await boot([task('other')], '?task=task&session=1&embed=1')
+    await vi.waitFor(() => expect(w.document.getElementById('messages')!.textContent).toContain('无权访问'))
+    expect(streams).toHaveLength(0)
+  })
   it('opens the exact worker panel from a channel link and preserves it across a page reload', async () => {
     const { w, streams } = await boot([task()])
     await vi.waitFor(() => expect(streams).toHaveLength(1))

@@ -1,6 +1,13 @@
 const $ = id => document.getElementById(id)
 let tasks = [], selected, filter = 'all', stream, generation = 0, streaming = '', poll
 const initial = new URLSearchParams(location.search)
+const embedded = initial.get('embed') === '1'
+document.documentElement.classList.toggle('embedded-session', embedded)
+function applyTheme(theme) { if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme }
+applyTheme(initial.get('theme'))
+window.addEventListener('message', event => {
+  if (embedded && event.source === parent && event.origin === location.origin && event.data?.type === 'team-peppy:theme') applyTheme(event.data.theme)
+})
 let requestedTask = initial.get('task'), sessionRequested = initial.get('session') === '1'
 const drafts = new Map(), requests = new Map(), records = new Map()
 const labels = { working: '进行中', person: '待处理', idle: '等待消息', ended: '已结束' }
@@ -58,7 +65,14 @@ function renderMessages() {
 }
 function openSession(t) {
   sessionRequested = true; locationForTask()
-  if (!t.sessionId) { generation++; stream?.close(); stream = undefined; $('session-panel').hidden = true; $('layout').classList.remove('session-open', 'expanded'); return }
+  if (!t.sessionId) {
+    generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''; renderMessages()
+    $('session-panel').hidden = !embedded; $('layout').classList.toggle('session-open', embedded)
+    $('session-title').textContent = t.sessionName || t.title; $('session-state').textContent = '等待创建 worker session'
+    activity('排队中，等待分配 worker'); feedback('会话创建后会自动连接。')
+    $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
+    return
+  }
   if (stream && stream.taskId === t.id) return
   generation++; const own = generation; stream?.close(); records.clear(); streaming = ''; renderMessages()
   $('session-panel').hidden = false; $('layout').classList.add('session-open'); $('session-title').textContent = t.title
@@ -84,23 +98,31 @@ async function refresh() {
   try {
     const result = await api('tasks'); tasks = result.items; $('connection').textContent = '已连接 DSH'
     if (!selected && requestedTask) {
-      const target = tasks.find(t => t.id === requestedTask)
+      let target = tasks.find(t => t.id === requestedTask)
+      if (!target) { try { const exact = await api(`tasks/${encodeURIComponent(requestedTask)}`); if (exact.id === requestedTask) { target = exact; tasks.push(exact) } } catch {} }
       if (target) select(target)
-      else $('detail').replaceChildren(element('p', 'empty', '此任务不存在或当前账号无权访问，请在对应工作区登录。'))
+      else { $('detail').replaceChildren(element('p', 'empty', '此任务不存在或当前账号无权访问，请在对应工作区登录。')); if (embedded) showUnavailable('此任务不存在或当前账号无权访问，请在对应工作区登录。') }
     }
     if (selected) {
       const current = tasks.find(t => t.id === selected.id)
-      if (!current) { closeSession(); selected = undefined; $('detail').replaceChildren(element('p', 'empty', '任务已不可访问，请重新选择。')) }
+      if (!current) { closeSession(); selected = undefined; $('detail').replaceChildren(element('p', 'empty', '任务已不可访问，请重新选择。')); if (embedded) showUnavailable('任务已不可访问，请重新选择。') }
       else { const changed = current.sessionId !== selected.sessionId; selected = current; detail(current); if (sessionRequested && (changed || !stream)) openSession(current)
-        $('prompt').disabled = !current.canWrite; $('send').disabled = !current.canWrite || requests.get(current.sessionId)?.sending === true; $('cancel-turn').disabled = !current.canWrite }
+        $('prompt').disabled = !current.sessionId || !current.canWrite; $('send').disabled = !current.sessionId || !current.canWrite || requests.get(current.sessionId)?.sending === true; $('cancel-turn').disabled = !current.sessionId || !current.canWrite }
     }
     renderList()
-  } catch (error) { $('connection').textContent = error.message; if (error.status === 401 || error.status === 403) { closeSession(); tasks = []; selected = undefined; renderList(); $('task-list').replaceChildren(element('p', 'empty', '请先在当前浏览器登录 Huly 的 PT 工作区，再刷新此页。')) } }
+  } catch (error) { $('connection').textContent = error.message; if (error.status === 401 || error.status === 403) { closeSession(); tasks = []; selected = undefined; renderList(); $('task-list').replaceChildren(element('p', 'empty', '请先在当前浏览器登录 Huly 的 PT 工作区，再刷新此页。')); if (embedded) showUnavailable('请先登录对应的 Huly 工作区。') } }
+}
+function showUnavailable(text) {
+  generation++; stream?.close(); stream = undefined; records.clear(); streaming = ''
+  $('session-panel').hidden = false; $('layout').classList.add('session-open')
+  $('session-title').textContent = '会话暂不可用'; $('session-state').textContent = ''
+  $('messages').replaceChildren(element('p', 'empty', text)); activity('未连接'); feedback('')
+  $('prompt').disabled = true; $('send').disabled = true; $('cancel-turn').disabled = true
 }
 $('search').oninput = renderList
 $('filters').onclick = e => { const b = e.target.closest('[data-filter]'); if (!b) return; filter = b.dataset.filter; [...$('filters').children].forEach(x => x.setAttribute('aria-pressed', String(x === b))); renderList() }
 $('refresh').onclick = refresh
-$('close-session').onclick = closeSession
+$('close-session').onclick = () => { closeSession(); if (embedded && parent !== window) parent.postMessage({ type: 'team-peppy:close-session' }, location.origin) }
 $('expand').onclick = () => { const full = $('layout').classList.toggle('expanded'); $('expand').setAttribute('aria-label', full ? '还原会话宽度' : '展开会话') }
 $('prompt').oninput = () => { if (selected?.sessionId) drafts.set(selected.sessionId, $('prompt').value) }
 $('prompt').onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('composer').requestSubmit() } }

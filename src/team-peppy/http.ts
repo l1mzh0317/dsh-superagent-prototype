@@ -9,6 +9,7 @@ import type { Runtime } from '../app/runtime.ts'
 import { key, UserError, ticketStage, type Ticket, type Trigger } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from '../sources/huly-client.ts'
+import { hulyInputState, hulyMessageStatus } from '../sources/huly-feedback.ts'
 
 const Send = z.object({ sessionId: z.string(), requestId: z.string().uuid(), text: z.string().trim().min(1).max(40_000), mode: z.literal('steer').default('steer') }).strict()
 const Cancel = z.object({ sessionId: z.string() }).strict()
@@ -91,6 +92,23 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
       const token = requestToken(req, d.workspace), account = await huly.account(token)
       if (req.method !== 'GET' && (!origin || req.headers['x-team-peppy-request'] !== '1')) throw new HulyError(403, 'Same-origin request required')
       if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid }); return }
+      if (path === '/api/message-status' && req.method === 'GET') {
+        const ids = z.array(z.string().min(1).max(200)).max(100).parse(url.searchParams.getAll('message'))
+        const seen = new Set<string>(), channels = new Map<string, boolean>(), items = []
+        for (const trigger of runtime.store.read.messageTriggers('huly', d.workspace, [...new Set(ids)])) {
+          const messageId = String(trigger.meta.messageId), channel = trigger.channel?.address.channelId
+          if (seen.has(messageId) || !channel || !allowedChannels().includes(channel)) continue
+          seen.add(messageId)
+          if (!channels.has(channel)) channels.set(channel, !!await huly.one(HULY.channel, channel, token))
+          if (!channels.get(channel)) continue
+          // A status must not disclose another channel's task name or a mixed-source worker.
+          const linked = hulyInputState(runtime, d.workspace, trigger).tickets
+          if ((await Promise.all(linked.map(t => mayRead(t, token)))).some(ok => !ok)) continue
+          const status = hulyMessageStatus(runtime, d.workspace, trigger)
+          if (status) items.push(status)
+        }
+        json(res, 200, { workspace: d.workspace, items }); return
+      }
       if (path === '/api/tasks' && req.method === 'GET') {
         const rows = runtime.store.tickets.list().filter(t => ticketChannels(t, d.workspace).length).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
         const visible = []

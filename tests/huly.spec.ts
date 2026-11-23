@@ -11,6 +11,12 @@ const message = (overrides: Partial<HulyDoc> = {}): HulyDoc => ({ _id: 'root', _
   modifiedBy: 'alice', createdBy: 'alice', message: mention, ...overrides })
 
 describe('Huly Source', () => {
+  it('keeps native acknowledgements as badge state without publishing a receipt-only chat message', async () => {
+    const client = new HulyClient(d), reply = vi.spyOn(client, 'reply').mockResolvedValue('sent')
+    const source = hulyKind(client)
+    expect(await source.channel!.send({} as never, { kind: 'acknowledgement' } as never)).toBe('sent')
+    expect(reply).not.toHaveBeenCalled()
+  })
   it('recognizes typed Person mentions and preserves thread identity across follow-ups', () => {
     const root = hulyTrigger(message(), d, 'channel')!
     expect(root.addressed).toBe('mention')

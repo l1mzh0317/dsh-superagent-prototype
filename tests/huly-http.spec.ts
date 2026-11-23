@@ -26,8 +26,10 @@ async function fixture() {
     agents: { get: () => ({ status: 'running' }) }, sessionController: { prompt, cancel, follow: async function* () {
       yield { type: 'snapshot', cursor: 0, records: [], projections: {} }
     } } } as unknown as Context
+  const disposition = vi.fn(() => ({ fanout: [] as string[], acked: [] as string[] }))
+  const messageTriggers = vi.fn(() => [{ id: 'input', human: true, addressed: 'mention', actor: { source: 'huly', id: 'author-social' }, meta: { workspace: 'a', messageId: 'message' }, channel: ticket.channels[0] }] as unknown as import('../src/core/index.ts').Trigger[])
   const runtime = { ready: Promise.resolve(), configured: () => true, sources: { instance: () => ({ config: { channels: ['c'] } }) },
-    store: { atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition: () => ({ fanout: [] }) },
+    store: { get: () => undefined, read: { messageTriggers }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
       tickets: { list: () => [ticket], get: (id: string) => id === 'task' ? ticket : undefined } }, engine: { receive, attach }, passes: { request: vi.fn() } } as unknown as Runtime
   registerTeamPeppy(ctx, runtime, huly)
   const server = createServer((req, res) => { void handler(req, res) }); servers.push(server)
@@ -37,9 +39,25 @@ async function fixture() {
   const call = (path: string, data?: unknown, overrides = {}) => fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/team-peppy/api/${path}`, {
     headers: { ...headers, ...overrides }, ...(data ? { method: 'POST', body: JSON.stringify(data) } : {}),
   })
-  return { call, account, channel, prompt, cancel, ticket, receive, attach }
+  return { call, account, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition }
 }
 describe('Huly-authenticated worker bridge', () => {
+  it('returns only message-header status and a real session binding after channel authorization', async () => {
+    const f = await fixture()
+    f.disposition.mockReturnValue({ fanout: ['task'], acked: ['task'] })
+    const res = await f.call('message-status?message=message')
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ workspace: 'a', items: [expect.objectContaining({ messageId: 'message', taskId: 'task', state: 'running', sessionName: 'Investigate', sessionId: 'worker-task' })] })
+    f.channel.mockResolvedValue(undefined)
+    expect(await (await f.call('message-status?message=message')).json()).toEqual({ workspace: 'a', items: [] })
+  })
+  it('refuses unbounded message polling and never exposes a linked private channel', async () => {
+    const f = await fixture()
+    expect((await f.call('message-status?'+Array(101).fill('message=x').join('&'))).status).toBe(400)
+    f.disposition.mockReturnValue({ fanout: ['task'], acked: ['task'] })
+    f.ticket.channels.push({ source: 'github', thread: 'private', address: {} } as never)
+    expect((await (await f.call('message-status?message=message')).json()).items).toEqual([])
+  })
   it('submits to the existing worker Session and scopes idempotency by authenticated operator', async () => {
     const f = await fixture(), requestId = '25240cbb-a470-4623-818e-20cfbe564928'
     const res = await f.call('tasks/task/messages', { sessionId: 'worker-task', requestId, text: 'Check the original issue', mode: 'steer' })

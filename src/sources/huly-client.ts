@@ -11,7 +11,6 @@ export interface HulyDoc {
   [name: string]: unknown
 }
 export interface HulyAccount { uuid: string; role: string; socialIds: string[] }
-export interface HulySessionLink { ticketId: string; title: string; sessionId: string }
 export interface HulyDeployment {
   workspace: string; workspaceUrl: string; origin: string; endpoint: string; tokenFile: string
   botPerson: string; botSocial: string; botAccount: string; channels: string[]; operators: string[]
@@ -58,40 +57,7 @@ export class HulyClient {
   dashboardUrl(ticketId: string): string {
     return `${this.deployment.origin}/files/${encodeURIComponent(this.deployment.workspace)}/team-peppy/?task=${encodeURIComponent(ticketId)}&session=1`
   }
-  async receivedReaction(messageId: string): Promise<void> {
-    const id = key('huly-received', this.deployment.workspace, messageId)
-    if (await this.one(HULY.reaction, id)) return
-    const parent = await this.one(HULY.message, messageId)
-    if (!parent) return
-    await this.api('tx', undefined, {
-      _id: key('huly-received-tx', id), _class: 'core:class:TxCreateDoc', space: 'core:space:Tx',
-      objectId: id, objectClass: HULY.reaction, objectSpace: parent.space,
-      modifiedOn: Date.now(), modifiedBy: this.deployment.botSocial, createdBy: this.deployment.botSocial,
-      attachedTo: parent._id, attachedToClass: parent._class, collection: 'reactions',
-      attributes: { emoji: '✅', createBy: this.deployment.botSocial },
-    })
-  }
-  /** One editable receipt per input: retries never create another status message. */
-  async feedback(rootId: string, channelId: string, triggerId: string, text: string, session?: HulySessionLink): Promise<void> {
-    const id = key('huly-reply', this.deployment.workspace, `feedback:${triggerId}`)
-    const markup = this.replyMarkup(text, session)
-    const existing = await this.one(HULY.message, id)
-    if (!existing) { await this.reply(rootId, channelId, `feedback:${triggerId}`, text, session); return }
-    if (existing.createdBy !== this.deployment.botSocial || existing.attachedTo !== rootId || existing.space !== channelId) throw new Error('Feedback message ownership or channel mismatch')
-    if (existing.message === markup) return
-    await this.api('tx', undefined, { _id: key('huly-feedback-update', id, String(Date.now()), markup),
-      _class: 'core:class:TxUpdateDoc', space: 'core:space:Tx', objectId: id, objectClass: HULY.reply,
-      objectSpace: existing.space, modifiedOn: Date.now(), modifiedBy: this.deployment.botSocial,
-      operations: { message: markup } })
-  }
-  private replyMarkup(text: string, session?: HulySessionLink): string {
-    const markup = JSON.parse(textMarkup(text)) as { content: unknown[] }
-    if (session) markup.content.push({ type: 'paragraph', content: [{ type: 'text',
-      text: `Worker · ${session.title} · ${session.sessionId}`,
-      marks: [{ type: 'link', attrs: { href: this.dashboardUrl(session.ticketId), target: '_blank', rel: 'noopener noreferrer' } }] }] })
-    return JSON.stringify(markup)
-  }
-  async reply(rootId: string, channelId: string, receiptId: string, text: string, session?: HulySessionLink): Promise<'sent' | 'gone'> {
+  async reply(rootId: string, channelId: string, receiptId: string, text: string): Promise<'sent' | 'gone'> {
     const id = key('huly-reply', this.deployment.workspace, receiptId)
     if (await this.one(HULY.message, id)) return 'sent'
     const parent = await this.one(HULY.message, rootId)
@@ -104,7 +70,7 @@ export class HulyClient {
       objectId: id, objectClass: HULY.reply, objectSpace: parent.space,
       modifiedOn: stamp, modifiedBy: this.deployment.botSocial, createdBy: this.deployment.botSocial,
       attachedTo: parent._id, attachedToClass: parent._class, collection: 'replies',
-      attributes: { message: this.replyMarkup(text, session), objectId: parent.attachedTo, objectClass: parent.attachedToClass },
+      attributes: { message: textMarkup(text), objectId: parent.attachedTo, objectClass: parent.attachedToClass },
     })
     return 'sent'
   }

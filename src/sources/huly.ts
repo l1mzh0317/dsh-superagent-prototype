@@ -10,7 +10,6 @@ import type { Runtime } from '../app/runtime.ts'
 import { HULY, HulyClient, hulyThreadUrl, readMarkup, type HulyDeployment, type HulyDoc } from './huly-client.ts'
 import { registerTeamPeppy } from '../team-peppy/http.ts'
 import { HulyFeedback, noteHulyReply } from './huly-feedback.ts'
-import { workerSessionId } from '../executor/dsh.ts'
 
 export const SOURCE = 'huly'
 export const HulyConfig = z.object({ workspace: z.string(), channels: z.array(z.string()), pollMs: z.number().int().min(1000).max(60_000).default(2000) })
@@ -46,13 +45,13 @@ export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): 
     channel: {
       allowed: (a, c) => a.workspace === c.workspace && c.channels.includes(a.channelId ?? ''),
       send: async (_, m) => {
-        const ticket = m.ticketId ? runtime?.store.tickets.get(m.ticketId) : undefined
-        const result = await client.reply(m.channel.address.rootId!, m.channel.address.channelId!, m.id, m.text,
-          ticket ? { ticketId: ticket.id, title: ticket.title, sessionId: workerSessionId(ticket.id) } : undefined)
+        // Native acknowledgement/disposition remains intact; its visual receipt is the message-header badge.
+        if (m.kind === 'acknowledgement') return 'sent'
+        const result = await client.reply(m.channel.address.rootId!, m.channel.address.channelId!, m.id, m.text)
         if (result === 'sent' && runtime) {
           // Match a native answer/ack receipt to its exact original input, not every message in the conversation.
           for (const trigger of runtime.store.read.threadTriggers(`huly:${m.channel.thread}`, 100)) {
-            if (m.id === key('reply', trigger.id, m.text) || m.id === key('ack', trigger.id)) noteHulyReply(runtime, client, trigger)
+            if (m.id === key('reply', trigger.id, m.text)) noteHulyReply(runtime, client, trigger)
           }
         }
         return result
