@@ -10,6 +10,7 @@ import { key, UserError, ticketStage, type Ticket, type Trigger } from '../core/
 import { workerSessionId } from '../executor/dsh.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from '../sources/huly-client.ts'
 import { contextView } from './context.ts'
+import { Instances } from './instances.ts'
 import { HulyRouting, hulyDiscussionTitle, hulyMayChoose, hulyTaskSources, mayReadHulyTask, mayWriteHulyTask } from '../sources/huly-routing.ts'
 import { hulyInputState, hulyMessageStatus, statusCutover } from '../sources/huly-feedback.ts'
 
@@ -67,6 +68,7 @@ export function publicStreamText(records: readonly unknown[] = []): string {
 }
 export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClient, routing = new HulyRouting(runtime, huly)): () => void {
   const d = huly.deployment
+  const instances = new Instances(runtime.store, huly)
   if (!runtime.store.get(statusCutover(d.workspace))) runtime.store.set(statusCutover(d.workspace), new Date().toISOString())
   const allowedChannels = () => runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels ?? []
   const mayRead = (ticket: Ticket, token: string) => mayReadHulyTask(runtime, huly, ticket, token)
@@ -103,6 +105,11 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
         if (!requestFromHuly || foreign || req.headers['x-team-peppy-request'] !== '1') {
           throw new HulyError(403, '无法验证请求，请重试')
         }
+      }
+      const instanceOperation = path.match(/^\/api\/instances(?:\/([a-z-]+))?$/)
+      if (instanceOperation) {
+        json(res, 200, await instances.handle(instanceOperation[1] ?? '', req.method, url.searchParams, () => body(req), token, account))
+        return
       }
       if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid, botPerson: d.botPerson }); return }
       if (path === '/api/route-options' && req.method === 'GET') {

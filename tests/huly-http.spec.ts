@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Runtime } from '../src/app/runtime.ts'
 import type { Ticket } from '../src/core/index.ts'
@@ -16,7 +19,7 @@ async function fixture() {
     assignments: [{ id: 'assignment', createdAt: '2026-11-23', startedAt: '2026-11-23', state: 'running' }], inputs: [], undelivered: [], createdAt: '2026-11-23', updatedAt: '2026-11-23', origin: { triggerId: 'root', triggerIds: ['root'] } } as unknown as Ticket
   const huly = new HulyClient(deployment)
   const account = vi.spyOn(huly, 'account').mockResolvedValue({ uuid: 'owner', role: 'USER', socialIds: ['author-social'] })
-  vi.spyOn(huly, 'find').mockResolvedValue([])
+  const directory = vi.spyOn(huly, 'find').mockResolvedValue([])
   const channel = vi.spyOn(huly, 'one').mockResolvedValue({ _id: 'c' } as never)
   const prompt = vi.fn().mockResolvedValue({ accepted: true }), cancel = vi.fn().mockReturnValue({ accepted: true })
   const triggers = new Map<string, unknown>()
@@ -31,8 +34,9 @@ async function fixture() {
   const disposition = vi.fn(() => ({ fanout: [] as string[], acked: [] as string[] }))
   const messageTriggers = vi.fn(() => [{ id: 'input', human: true, addressed: 'mention', actor: { source: 'huly', id: 'author-social' }, meta: { workspace: 'a', messageId: 'message' }, channel: ticket.channels[0] }] as unknown as import('../src/core/index.ts').Trigger[])
   const threadMessages = vi.fn(() => [] as import('../src/core/index.ts').Trigger[])
+  const values = new Map<string, unknown>()
   const runtime = { ready: Promise.resolve(), configured: () => true, sources: { instance: () => ({ config: { channels: ['c'] } }) },
-    store: { get: () => undefined, set: vi.fn(), read: { messageTriggers, hulyThreadMessages: threadMessages, hulyDiscussionRoots: discussionRoots, hulyDiscussionMessages: () => [] }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
+    store: { get: (key: string) => values.get(key), set: (key: string, value: unknown) => values.set(key, value), read: { messageTriggers, hulyThreadMessages: threadMessages, hulyDiscussionRoots: discussionRoots, hulyDiscussionMessages: () => [] }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
       tickets: { list: () => [ticket], get: (id: string) => id === 'task' ? ticket : undefined } }, engine: { receive, attach }, passes: { request: vi.fn() } } as unknown as Runtime
   registerTeamPeppy(ctx, runtime, huly)
   const server = createServer((req, res) => { void handler(req, res) }); servers.push(server)
@@ -42,7 +46,7 @@ async function fixture() {
   const call = (path: string, data?: unknown, overrides = {}) => fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/team-peppy/api/${path}`, {
     headers: { ...headers, ...overrides }, ...(data ? { method: 'POST', body: JSON.stringify(data) } : {}),
   })
-  return { call, account, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages, discussionRoots, triggers }
+  return { call, account, directory, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages, discussionRoots, triggers }
 }
 describe('Huly-authenticated worker bridge', () => {
   it('returns only message-header status and a real session binding after channel authorization', async () => {
@@ -139,5 +143,117 @@ describe('Huly-authenticated worker bridge', () => {
     f.channel.mockResolvedValue(undefined)
     res = await f.call('tasks'); expect((await res.json()).items).toEqual([])
     res = await f.call('tasks/task/session'); expect(res.status).toBe(404)
+  })
+})
+
+describe('workspace Instances', () => {
+  it('stages the exact services for live Huly members and hides them before application and during revocation', async () => {
+    const f = await fixture()
+    const identity = (uuid: string, role: string) => f.account.mockResolvedValue({ uuid, role, socialIds: [uuid + '-social'] })
+    const host = { name: 'Build server', address: '100.70.0.9', service: { name: 'Build logs', protocol: 'https', port: 8443 } }
+    const alice = { account: 'alice', login: 'alice@example.test' }
+    const bob = { account: 'bob', login: 'bob@example.test' }
+    expect((await f.call('instances/machines', host)).status).toBe(403)
+    expect((await f.call('instances/members')).status).toBe(403)
+
+    identity('owner', 'OWNER')
+    const first = await f.call('instances/machines', host)
+    expect(first.status).toBe(200)
+    const machine = await first.json()
+    expect(await (await f.call('instances/machines', host)).json()).toEqual(machine)
+    const listed = await (await f.call('instances')).json()
+    const serviceId = listed.machines[0].services[0].id
+    const query = 'instances/connection?service=' + serviceId
+    const draft = { serviceId, group: 'group:developers', members: [alice] }
+    expect((await f.call('instances/preview', draft)).status).toBe(400)
+
+    f.directory.mockResolvedValue([
+      { personUuid: 'alice', name: 'Alice' }, { personUuid: 'bob', name: 'Bob' },
+    ] as never)
+    expect(await (await f.call('instances/members')).json()).toEqual({ members: [
+      { account: 'alice', name: 'Alice' }, { account: 'bob', name: 'Bob' },
+    ] })
+    expect(await (await f.call('instances/preview', draft)).json()).toEqual({
+      grant: { src: ['group:developers'], dst: [host.address], ip: ['tcp:8443'] },
+      tests: [{ src: alice.login, proto: 'tcp', accept: [host.address + ':8443'] }],
+    })
+    const grant = await (await f.call('instances/grants', draft)).json()
+    expect(await (await f.call('instances/grants', draft)).json()).toEqual(grant)
+    expect((await f.call('instances/grants', { serviceId, members: [bob] })).status).toBe(200)
+    expect((await f.call('instances/grants', { serviceId, members: [alice] })).status).toBe(409)
+    const grantId = grant.id
+
+    identity('alice', 'USER')
+    expect(await (await f.call('instances')).json()).toEqual({ admin: false, machines: [], grants: [] })
+    expect((await f.call(query)).status).toBe(404)
+    expect((await f.call('instances/grant-state', { grantId, action: 'confirm' })).status).toBe(403)
+
+    identity('owner', 'OWNER')
+    expect((await f.call('instances/grant-state', { grantId, action: 'confirm-revoked' })).status).toBe(409)
+    expect(await (await f.call('instances/grant-state', { grantId, action: 'confirm' })).json()).toEqual({ state: 'applied' })
+    identity('bob', 'USER')
+    expect((await f.call(query)).status).toBe(404)
+    identity('alice', 'USER')
+    expect(await (await f.call(query)).json()).toEqual({
+      workspaceUrl: 'pt', address: host.address, port: 8443, protocol: 'https', logins: [alice.login],
+    })
+    expect((await (await f.call('instances')).json()).grants).toEqual([])
+    expect((await f.call('instances/probe', { serviceId })).status).toBe(403)
+
+    identity('owner', 'OWNER')
+    expect(await (await f.call('instances/grant-state', { grantId, action: 'revoke' })).json()).toEqual({ state: 'revoking' })
+    const removal = await (await f.call('instances/grant-policy', { grantId })).json()
+    expect(removal.tests).toEqual([{ src: alice.login, proto: 'tcp', deny: [host.address + ':8443'] }])
+    identity('alice', 'USER')
+    expect((await f.call(query)).status).toBe(404)
+    identity('owner', 'OWNER')
+    expect(await (await f.call('instances/grant-state', { grantId, action: 'confirm-revoked' })).json()).toEqual({ state: 'revoked' })
+  })
+
+  it('sends the registered endpoint to the host probe over the private socket', async () => {
+    const f = await fixture()
+    f.account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: ['owner-social'] })
+    const host = { name: 'Logs', address: '100.71.0.9', service: { name: 'HTTPS', protocol: 'https', port: 8443 } }
+    await f.call('instances/machines', host)
+    const serviceId = (await (await f.call('instances')).json()).machines[0].services[0].id
+    const temp = await mkdtemp(join(tmpdir(), 'pepper-probe-'))
+    const socketPath = join(temp, 'probe.sock')
+    const paths: (string | undefined)[] = []
+    const server = createServer((req, res) => {
+      paths.push(req.url)
+      res.end(JSON.stringify({ reachable: true }))
+    })
+    const previous = process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET
+    try {
+      await new Promise<void>(resolve => server.listen(socketPath, resolve))
+      process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET = socketPath
+      expect((await f.call('instances/probe', { serviceId, address: '127.0.0.1' })).status).toBe(400)
+      const checked = await f.call('instances/probe', { serviceId })
+      expect(checked.status).toBe(200)
+      expect(await checked.json()).toMatchObject({ reachable: true, checkedAt: expect.any(String) })
+      expect(paths).toEqual(['/probe?address=100.71.0.9&port=8443'])
+    } finally {
+      if (previous === undefined) delete process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET
+      else process.env.TEAM_PEPPY_INSTANCES_PROBE_SOCKET = previous
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      await rm(temp, { recursive: true })
+    }
+  })
+
+  it('rejects arbitrary addresses, workspace switches, guest access and cross-origin changes', async () => {
+    const f = await fixture()
+    f.account.mockResolvedValue({ uuid: 'owner', role: 'ADMIN', socialIds: ['owner'] })
+    const host = { name: 'Storage', service: { name: 'SSH', protocol: 'ssh', port: 22 } }
+    for (const address of ['localhost', '127.0.0.1', '169.254.169.254', '100.128.0.1', 'https://example.test', '::ffff:100.64.1.1', 'fd00::1']) {
+      expect((await f.call('instances/machines', { ...host, address })).status).toBe(400)
+    }
+    const request = { ...host, address: 'fd7a:115c:a1e0::9' }
+    expect((await f.call('instances/machines', request, { origin: 'https://foreign.test' })).status).toBe(403)
+    const token = 'header.' + Buffer.from('{"workspace":"foreign"}').toString('base64url') + '.sig'
+    expect((await f.call('instances/machines', request, { authorization: 'Bearer ' + token })).status).toBe(403)
+    expect((await f.call('instances/machines', request)).status).toBe(200)
+    f.account.mockResolvedValue({ uuid: 'guest', role: 'GUEST', socialIds: ['guest'] })
+    expect((await f.call('instances')).status).toBe(403)
   })
 })
