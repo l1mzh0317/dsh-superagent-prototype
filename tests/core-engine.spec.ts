@@ -74,11 +74,23 @@ function accepted(h: ReturnType<typeof harness>, id = '1', thread = 't1') {
 describe('intake', () => {
   it('keeps a source-verified new-session request from being attached to older work', () => {
     const h = harness(), old = accepted(h).ticketId!
-    h.engine.receive(trigger('2', { newTicket: true, threads: [{ source: 'chat', id: 'selected:2' }] })); h.pump()
+    h.engine.receive(trigger('2', { newTicket: true, threads: [{ source: 'chat', id: 'selected:2' }, { source: 'chat', id: 't1' }] })); h.pump()
     expect(() => h.engine.attach(old, '2')).toThrow(new UserError('newTicketRequested'))
     const decision = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Separate work', scope: 'small', reason: 'explicit new session', acknowledgement: 'ok' })
     expect(decision.ticketId).not.toBe(old)
     expect(h.repo.tickets.get(old)!.inputs.some(i => i.kind === 'trigger' && i.triggerId === '2')).toBe(false)
+  })
+  it('routes a verified manual choice only to its target and preserves that thread for later discussion', () => {
+    const h = harness(), first = accepted(h).ticketId!, second = accepted(h, '2', 't2').ticketId!
+    h.engine.receive(trigger('3', { targetTicket: second, threads: [{ source: 'chat', id: 'selected:3' }, { source: 'chat', id: 't1' }] }))
+    expect(h.repo.triggers.disposition('3')!.fanout).toEqual([])
+    expect(() => h.engine.attach(first, '3')).toThrow(new UserError('sessionTargetMismatch'))
+    h.engine.attach(second, '3'); h.settle()
+    h.engine.receive(trigger('4'))
+    expect(h.repo.triggers.disposition('4')!.fanout).toContain(second)
+    expect(h.repo.tickets.get(first)!.inputs.some(i => i.kind === 'trigger' && i.triggerId === '3')).toBe(false)
+    h.engine.receive(trigger('5', { targetTicket: second }))
+    expect(h.repo.triggers.disposition('5')!.fanout).toEqual([second])
   })
   it('stores a trigger once and records source filtering', () => {
     const h = harness()

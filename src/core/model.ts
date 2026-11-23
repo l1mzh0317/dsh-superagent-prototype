@@ -32,6 +32,8 @@ export interface Trigger {
   addressed?: 'mention' | 'direct'
   /** Source-verified request to start separate work; the main Session may not attach it to an older ticket. */
   newTicket?: true
+  /** Source-verified optional target; automatic subscription fan-out must not send this input elsewhere. */
+  targetTicket?: string
   at: string
   text: string
   channel?: ChannelRef

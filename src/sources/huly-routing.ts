@@ -46,13 +46,14 @@ export class HulyRouting {
       if (account.uuid !== grant.account || !account.socialIds.includes(trigger.actor.id) || !await this.client.one(HULY.channel, String(trigger.meta.channelId), grant.token)) throw new HulyError(403, 'Membership changed')
       const ticket = grant.task === 'new' ? undefined : this.runtime.store.tickets.get(grant.task)
       if (grant.task !== 'new' && (!ticket || !await mayReadHulyTask(this.runtime, this.client, ticket, grant.token) || !mayWriteHulyTask(this.client, ticket, account))) throw new HulyError(403, 'Task access changed')
-      // A private evaluation lane prevents subscription fan-out before a manual choice is attached.
-      // Original Huly thread identity remains in channel/meta for context, replies and source links.
-      const routed: Trigger = { ...trigger, threads: [{ source: 'huly', id: `selected:${trigger.id}` }],
-        ...(ticket ? {} : { newTicket: true }), meta: { ...trigger.meta, peppyRoute: undefined, sessionChoice: grant.task, statusVersion: 2 } }
+      // A private primary evaluation lane isolates a new request; verified core routing limits fan-out.
+      // Keep original native Threads too, so later unmentioned discussion reaches the selected worker.
+      const routed: Trigger = { ...trigger, threads: [{ source: 'huly', id: `selected:${trigger.id}` }, ...trigger.threads],
+        ...(ticket ? { targetTicket: ticket.id } : { newTicket: true }), meta: { ...trigger.meta, peppyRoute: undefined, sessionChoice: grant.task, statusVersion: 2 } }
       const result = this.runtime.store.atomic(() => {
         const result = this.runtime.engine.receive(routed)
-        if (result !== 'filtered' && ticket) this.runtime.engine.attach(ticket.id, routed.id, 'Authenticated Huly member selected this existing session')
+        const disposition = this.runtime.store.triggers.disposition(routed.id)
+        if (result !== 'filtered' && ticket && (!disposition?.fanout.includes(ticket.id) || disposition.context?.includes(ticket.id))) this.runtime.engine.attach(ticket.id, routed.id, 'Authenticated Huly member selected this existing session')
         return result
       })
       this.runtime.passes.request()
