@@ -44,7 +44,7 @@ export function hulyMessageStatus(runtime: Pick<Runtime, 'store'>, workspace: st
   } else if (answered) { state = 'completed'; label = '已回复' }
   else if (decision?.kind === 'unavailable') { state = 'failed'; label = '处理暂不可用' }
   else { state = 'processing'; label = '处理中' }
-  if (settings.paused && state !== 'completed' && state !== 'stopped') { state = 'paused'; label = '已暂停' }
+  if (settings.paused && !['completed', 'stopped', 'ended', 'blocked', 'failed'].includes(state)) { state = 'paused'; label = '已暂停' }
   return { messageId: String(trigger.meta.messageId), state, label, taskId: ticket?.id ?? null,
     sessionName: ticket?.title ?? null,
     sessionId: ticket?.assignments.some(a => a.startedAt) ? workerSessionId(ticket.id) : null, taskCount: tickets.length }

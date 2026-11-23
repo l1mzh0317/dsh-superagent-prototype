@@ -97,9 +97,11 @@ function openSession(t) {
 async function refresh() {
   try {
     const result = await api('tasks'); tasks = result.items; $('connection').textContent = '已连接 DSH'
+    if (requestedTask && !tasks.some(t => t.id === requestedTask)) {
+      try { const exact = await api(`tasks/${encodeURIComponent(requestedTask)}`); if (exact.id === requestedTask) tasks.push(exact) } catch {}
+    }
     if (!selected && requestedTask) {
-      let target = tasks.find(t => t.id === requestedTask)
-      if (!target) { try { const exact = await api(`tasks/${encodeURIComponent(requestedTask)}`); if (exact.id === requestedTask) { target = exact; tasks.push(exact) } } catch {} }
+      const target = tasks.find(t => t.id === requestedTask)
       if (target) select(target)
       else { $('detail').replaceChildren(element('p', 'empty', '此任务不存在或当前账号无权访问，请在对应工作区登录。')); if (embedded) showUnavailable('此任务不存在或当前账号无权访问，请在对应工作区登录。') }
     }

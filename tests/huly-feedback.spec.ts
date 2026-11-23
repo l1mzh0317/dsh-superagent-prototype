@@ -26,6 +26,8 @@ describe('Message-header delivery state', () => {
     f.tickets[0]!.ended = { by: 'human', at: 'now' } as never
     expect(f.status()).toMatchObject({ state: 'stopped' })
     f.tickets[0]!.ended = { by: 'pull', at: 'now', outcome: 'closed' } as never
+    const settings = f.runtime.store.settings()
+    f.runtime.store.settings = () => ({ ...settings, paused: true })
     expect(f.status()).toMatchObject({ state: 'ended', label: '已结束' })
     await receipt.sync(); expect(f.api).not.toHaveBeenCalled()
   })

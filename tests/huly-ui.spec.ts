@@ -16,6 +16,17 @@ async function boot(items: unknown[], query = '?task=task&session=1') {
 }
 const task = (id = 'task', sessionId: string | null = 'worker-task') => ({ id, title: '检查部署', sessionName: '检查部署', sessionId, sessionStatus: 'running', createdAt: '2026-11-23', state: { stage: 'working' }, canWrite: true })
 describe('Huly reply-to-session navigation', () => {
+  it('keeps an older linked worker open across polling even when it falls outside the task list page', async () => {
+    const { w, streams } = await boot([])
+    w.fetch = vi.fn(async (url: string) => ({ ok: true, json: async () => url === './api/tasks/task' ? task() : { items: [] } })) as never
+    w.document.getElementById('refresh')!.click()
+    await vi.waitFor(() => expect(streams).toHaveLength(1))
+    w.document.getElementById('refresh')!.click()
+    await vi.waitFor(() => expect(w.fetch).toHaveBeenCalledTimes(4))
+    expect(w.document.getElementById('session-panel')!.hidden).toBe(false)
+    expect(streams[0]!.close).not.toHaveBeenCalled()
+    expect(streams).toHaveLength(1)
+  })
   it('keeps an embedded queued session visible and disables input until the same worker is allocated', async () => {
     const items = [task('task', null)], { w, streams } = await boot(items, '?task=task&session=1&embed=1')
     expect(w.document.documentElement.classList.contains('embedded-session')).toBe(true)
