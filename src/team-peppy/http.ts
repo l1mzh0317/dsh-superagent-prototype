@@ -94,12 +94,14 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
       const token = requestToken(req, d.workspace), account = await huly.account(token)
       if (req.method !== 'GET') {
         const fetchSite = req.headers['sec-fetch-site']
-        const requestFromHuly = origin === d.origin || (!origin && (fetchSite === 'same-origin'
-          || (!fetchSite && req.headers.authorization === `Bearer ${token}`)))
-        // Pepper's embedded browser can omit Origin. Only browser-asserted same-origin
-        // requests or explicit credentials may use that path; a cookie alone is insufficient.
-        if (!requestFromHuly || (fetchSite && fetchSite !== 'same-origin') || req.headers['x-team-peppy-request'] !== '1') {
-          throw new HulyError(403, '请从当前 Huly 工作区发起操作')
+        // Electron's session.fetch forwards the explicit bearer but emits Sec-Fetch-Site: none.
+        // Only verified explicit credentials can compensate for both missing origin and same-origin metadata.
+        const explicit = req.headers.authorization === `Bearer ${token}`
+        const foreign = fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none'
+        const requestFromHuly = origin === d.origin || fetchSite === 'same-origin'
+          || (explicit && (!fetchSite || fetchSite === 'none'))
+        if (!requestFromHuly || foreign || req.headers['x-team-peppy-request'] !== '1') {
+          throw new HulyError(403, '无法验证请求，请重试')
         }
       }
       if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid, botPerson: d.botPerson }); return }

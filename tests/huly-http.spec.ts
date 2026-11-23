@@ -127,6 +127,9 @@ describe('Huly-authenticated worker bridge', () => {
     expect((await f.call('route', { task: 'task' }, { ...embedded, 'sec-fetch-site': 'cross-site' })).status).toBe(403)
     expect((await f.call('route', { task: 'task' }, embedded)).status).toBe(403)
     expect((await f.call('route', { task: 'task' }, { origin: '' })).status).toBe(200)
+    // Electron's session.fetch bypass of the app protocol is seen as a browser-initiated request.
+    expect((await f.call('route', { task: 'task' }, { origin: '', 'sec-fetch-site': 'none' })).status).toBe(200)
+    expect((await f.call('route', { task: 'task' }, { ...embedded, 'sec-fetch-site': 'none' })).status).toBe(403)
     expect((await f.call('route', { task: 'task' }, { origin: '', 'sec-fetch-site': 'same-site' })).status).toBe(403)
   })
   it('enforces current channel access and CSRF protection for write requests', async () => {
