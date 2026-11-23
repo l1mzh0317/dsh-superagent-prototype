@@ -127,13 +127,19 @@ export class Instances {
       row.personUuid !== this.huly.deployment.botAccount ? [{ account: row.personUuid, name: row.name }] : [])
   }
 
+  private async currentRecipients(token: string, accounts?: string[]) {
+    const [employees, workspace] = await Promise.all([this.directory(token, accounts), this.huly.workspaceMembers(token)])
+    const current = new Set(workspace.filter(member => members.has(member.role)).map(member => member.person))
+    return employees.filter(employee => current.has(employee.account))
+  }
+
   private async validateRecipients(recipients: GrantInput['members'], token: string): Promise<void> {
     const accounts = [...new Set(recipients.map(member => member.account))]
     const logins = new Set(recipients.map(member => member.login))
     if (accounts.length !== recipients.length || logins.size !== recipients.length) {
       throw new HulyError(400, '每位成员需要不同的 Tailscale 登录名')
     }
-    const people = await this.directory(token, accounts)
+    const people = await this.currentRecipients(token, accounts)
     if (!accounts.every(account => people.some(person => person.account === account))) {
       throw new HulyError(400, '请选择当前工作区的有效成员')
     }
@@ -231,7 +237,7 @@ export class Instances {
       return { workspaceUrl: this.huly.deployment.workspaceUrl, address: machine.address, port: service.port, protocol: service.protocol, logins }
     }
     if (!admin) throw new HulyError(403, '需要 Instances 管理权限')
-    if (method === 'GET' && operation === 'members') return { members: await this.directory(token) }
+    if (method === 'GET' && operation === 'members') return { members: await this.currentRecipients(token) }
     if (method !== 'POST') throw new HulyError(404, 'Unknown Instances operation')
 
     const updateManaged = <T>(apply: (current: Registry) => T): T => this.update(current => {

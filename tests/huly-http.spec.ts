@@ -173,7 +173,9 @@ describe('workspace Instances', () => {
 
     f.directory.mockResolvedValue([
       { personUuid: 'alice', name: 'Alice' }, { personUuid: 'bob', name: 'Bob' },
+      { personUuid: 'departed', name: 'Departed member' },
     ] as never)
+    f.workspaceMembers.mockResolvedValue([{ person: 'alice', role: 'USER' }, { person: 'bob', role: 'USER' }])
     expect(await (await f.call('instances/members')).json()).toEqual({ members: [
       { account: 'alice', name: 'Alice' }, { account: 'bob', name: 'Bob' },
     ] })
@@ -221,6 +223,8 @@ describe('workspace Instances', () => {
     const alice = { account: 'alice', login: 'alice@example.test' }, bob = { account: 'bob', login: 'bob@example.test' }
     const people = [{ personUuid: 'alice', name: 'Alice' }, { personUuid: 'bob', name: 'Bob' }]
     f.directory.mockResolvedValue(people as never)
+    const roster = [{ person: 'alice', role: 'USER' }, { person: 'bob', role: 'USER' }]
+    f.workspaceMembers.mockResolvedValue(roster)
     const hosts = [
       { name: 'A', address: '100.70.0.9', service: { protocol: 'ssh', port: 22 } },
       { name: 'B', address: '100.70.0.10', service: { protocol: 'ssh', port: 15030 } },
@@ -251,10 +255,11 @@ describe('workspace Instances', () => {
     expect((await catalog()).machines).toEqual([])
     expect((await f.call('instances/batch-state', { batchId, action: 'confirm' })).status).toBe(403)
     identity('owner', 'OWNER')
-    f.directory.mockResolvedValue(people.slice(0, 1) as never)
+    f.workspaceMembers.mockResolvedValue(roster.slice(0, 1))
+    expect((await f.call('instances/preview-batch', selection)).status).toBe(400)
     expect((await f.call('instances/batch-state', { batchId, action: 'confirm' })).status).toBe(400)
     expect((await catalog()).grants.every((g: { state: string }) => g.state === 'pending')).toBe(true)
-    f.directory.mockResolvedValue(people as never)
+    f.workspaceMembers.mockResolvedValue(roster)
     expect(await (await f.call('instances/batch-state', { batchId, action: 'confirm' })).json()).toEqual({ state: 'applied' })
     expect(await (await f.call('instances/batch-state', { batchId, action: 'confirm' })).json()).toEqual({ state: 'applied' })
     expect((await f.call('instances/batch-state', { batchId, action: 'discard' })).status).toBe(409)
@@ -344,7 +349,7 @@ describe('workspace Instances', () => {
     const recipient = 'ffb31a7f-bd99-4079-bde0-33bffd369c79'
     const auth = (uuid: string, role: string) => f.account.mockResolvedValue({ uuid, role, socialIds: [uuid + '-social'] })
     auth('owner', 'OWNER')
-    f.workspaceMembers.mockResolvedValue([{ person: delegate, role: 'USER' }])
+    f.workspaceMembers.mockResolvedValue([{ person: delegate, role: 'USER' }, { person: recipient, role: 'USER' }])
     let validationEntered: () => void
     let completeValidation: () => void
     const validating = new Promise<void>(resolve => { validationEntered = resolve })
