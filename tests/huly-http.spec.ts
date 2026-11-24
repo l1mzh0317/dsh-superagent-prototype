@@ -168,6 +168,10 @@ describe('workspace Instances', () => {
     const listed = await (await f.call('instances')).json()
     const serviceId = listed.machines[0].services[0].id
     const query = 'instances/connection?service=' + serviceId
+    expect(await (await f.call('instances/targets')).json()).toEqual({ targets: [] })
+    expect(await (await f.call('instances/targets?scope=team')).json()).toEqual({ targets: [
+      { serviceId, machine: host.name, note: host.service.name, port: 8443, protocol: 'https' },
+    ] })
     const draft = { serviceId, group: 'group:developers', members: [alice] }
     expect((await f.call('instances/preview', draft)).status).toBe(400)
 
@@ -191,6 +195,7 @@ describe('workspace Instances', () => {
 
     identity('alice', 'USER')
     expect(await (await f.call('instances')).json()).toEqual({ admin: false, machines: [], grants: [] })
+    expect(await (await f.call('instances/targets?scope=team')).json()).toEqual({ targets: [] })
     expect((await f.call(query)).status).toBe(404)
     expect((await f.call('instances/grant-state', { grantId, action: 'confirm' })).status).toBe(403)
 
@@ -203,6 +208,9 @@ describe('workspace Instances', () => {
     expect(await (await f.call(query)).json()).toEqual({
       workspaceUrl: 'pt', address: host.address, port: 8443, protocol: 'https', logins: [alice.login],
     })
+    expect((await (await f.call('instances/targets')).json()).targets).toEqual([
+      { serviceId, machine: host.name, note: host.service.name, port: 8443, protocol: 'https' },
+    ])
     expect((await (await f.call('instances')).json()).grants).toEqual([])
     expect((await f.call('instances/probe', { serviceId })).status).toBe(403)
 

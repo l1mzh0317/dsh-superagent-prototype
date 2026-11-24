@@ -46,7 +46,9 @@ export function hulyMessageStatus(runtime: Pick<Runtime, 'store'>, workspace: st
   const anchor = anchors.get(anchorKey)
   const entry = !!(ticket || answered) && (!anchor || anchor === trigger.id)
   let state = 'queued', label = '排队中'
-  if (trigger.meta.routingError) { state = 'failed'; label = '会话选择已失效，请重新选择后发送' }
+  if (trigger.meta.routingError) {
+    state = 'failed'; label = trigger.meta.instanceSelectionInvalid ? '实例已不可用，请重新选择后发送' : '会话选择已失效，请重新选择后发送'
+  }
   else if (!allowedSender(settings, trigger.actor)) { state = 'blocked'; label = '未获得任务权限' }
   else if (ticket) {
     const stage = ticketStage(ticket)

@@ -4,6 +4,7 @@ import type { Runtime } from '../app/runtime.ts'
 import { type Ticket, type Trigger, type ReceiveResult, UserError } from '../core/index.ts'
 import { allowedSender } from '../policy.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from './huly-client.ts'
+import { Instances } from '../team-peppy/instances.ts'
 
 /** Include physical message sources for older attached tickets, whose original channel list predates discussion selection. */
 export function hulyTaskSources(runtime: Runtime, ticket: Ticket) {
@@ -50,7 +51,8 @@ export async function hulyDiscussion(runtime: Runtime, client: HulyClient, id: s
 /** Validates a member’s optional choice at issuance and again at source intake, then uses the native Engine. */
 export class HulyRouting {
   private grants = new Map<string, Grant>()
-  constructor(private runtime: Runtime, private client: HulyClient) {}
+  constructor(private runtime: Runtime, private client: HulyClient,
+    private instances: Pick<Instances, 'requestedTarget'> = new Instances(runtime.store, client)) {}
   async issue(choice: string | HulyChoice, token: string, account: HulyAccount): Promise<{ route: string; expires: number }> {
     this.prune()
     if (this.grants.size >= 1000) throw new HulyError(429, '请稍后重试')
@@ -71,6 +73,17 @@ export class HulyRouting {
   async receive(trigger: Trigger): Promise<ReceiveResult> {
     const stored = this.runtime.store.triggers.get(trigger.id)
     if (stored) return 'duplicate'
+    const ids = trigger.meta.requestedInstanceIds
+    if (Array.isArray(ids)) {
+      const meta = { ...trigger.meta, requestedInstanceIds: undefined }
+      const target = ids.length === 1 && typeof ids[0] === 'string' && allowedSender(this.runtime.store.settings(), trigger.actor)
+        ? await this.instances.requestedTarget(ids[0], trigger.actor.id).catch((error: unknown) => {
+          if (error instanceof HulyError && [401, 403, 404].includes(error.status)) return undefined
+          throw error
+        }) : undefined
+      if (!target) return this.runtime.receive({ ...trigger, meta: { ...meta, routingError: true, instanceSelectionInvalid: true } })
+      trigger = { ...trigger, meta: { ...meta, resolvedInstance: target } }
+    }
     const route = trigger.addressed && trigger.human ? trigger.meta.peppyRoute : undefined
     if (!route) return this.runtime.receive(trigger)
     this.prune()

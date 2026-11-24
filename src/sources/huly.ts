@@ -21,7 +21,7 @@ const watchedThread = (workspace: string) => family<boolean>(`huly-watched-threa
 export function hulyTrigger(message: HulyDoc, deployment: HulyDeployment, channelId: string): Trigger | undefined {
   const actor = message.createdBy ?? message.modifiedBy
   if (!actor || actor === deployment.botSocial) return
-  const markup = readMarkup(message.message)
+  const markup = readMarkup(message.message, deployment.origin)
   if (!markup.text) return
   const root = message._class === HULY.reply ? String(message.attachedTo) : message._id
   const thread = `${deployment.workspace}:${channelId}:${root}`
@@ -33,7 +33,9 @@ export function hulyTrigger(message: HulyDoc, deployment: HulyDeployment, channe
     url: hulyThreadUrl(deployment, channelId, root),
     channel: { source: SOURCE, thread, address: { workspace: deployment.workspace, channelId, rootId: root } },
     meta: { workspace: deployment.workspace, channelId, rootId: root, messageId: message._id, edited: !!message.editedOn,
-      ...(!message.editedOn && markup.routes?.[deployment.botPerson] ? { peppyRoute: markup.routes[deployment.botPerson] } : {}) } }
+      ...(!message.editedOn && markup.routes?.[deployment.botPerson] ? { peppyRoute: markup.routes[deployment.botPerson] } : {}),
+      ...(!message.editedOn && markup.mentions.includes(deployment.botPerson) && markup.instanceIds
+        ? { requestedInstanceIds: markup.instanceIds } : {}) } }
 }
 export function hulyKind(client: HulyClient, runtime?: Pick<Runtime, 'store'>): SourceKind<HulyConfig> {
   const d = client.deployment

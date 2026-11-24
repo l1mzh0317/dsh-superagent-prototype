@@ -101,20 +101,34 @@ export function textMarkup(text: string): string {
   return JSON.stringify({ type: 'doc', content: text.split('\n').map(line => ({ type: 'paragraph', content: line ? [{ type: 'text', text: line }] : [] })) })
 }
 /** Markup is data; references only count as mentions when their node type and Person class match. */
-export function readMarkup(input: unknown): { text: string; mentions: string[]; routes?: Record<string, string> } {
+export function readMarkup(input: unknown, origin?: string): { text: string; mentions: string[]; routes?: Record<string, string>; instanceIds?: string[] } {
   const mentions: string[] = [], routes: Record<string, string> = {}
+  const instanceIds = new Set<string>()
   let root: unknown = input
   if (typeof input === 'string') { try { root = JSON.parse(input) } catch { return { text: input, mentions } } }
   let budget = 20_000
   const visit = (node: unknown, depth: number): string => {
     if (--budget < 0 || depth > 50 || !node || typeof node !== 'object') return ''
-    const n = node as { type?: string; text?: string; attrs?: Record<string, unknown>; content?: unknown[] }
+    const n = node as { type?: string; text?: string; attrs?: Record<string, unknown>; content?: unknown[]; marks?: unknown[] }
     if (n.type === 'reference' && n.attrs?.objectclass === HULY.person && typeof n.attrs.id === 'string') {
       mentions.push(n.attrs.id)
       if (typeof n.attrs.peppyRoute === 'string' && n.attrs.peppyRoute.length <= 100) routes[n.attrs.id] = n.attrs.peppyRoute
     }
+    if (origin && n.type === 'text' && Array.isArray(n.marks)) {
+      for (const mark of n.marks) {
+        if (!mark || typeof mark !== 'object') continue
+        const link = mark as { type?: string; attrs?: { href?: unknown } }
+        if (link.type !== 'link' || typeof link.attrs?.href !== 'string') continue
+        const url = URL.parse(link.attrs.href)
+        const id = url?.searchParams.get('pepper-instance')
+        if (url?.origin === origin && /^\/workbench\/[^/]+\/?$/.test(url.pathname) && id &&
+            /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) instanceIds.add(id)
+      }
+    }
     const text = typeof n.text === 'string' ? n.text : n.type === 'reference' ? String(n.attrs?.label ?? '') : ''
     return text + (Array.isArray(n.content) ? n.content.map(x => visit(x, depth + 1)).join('') : '') + (n.type === 'paragraph' || n.type === 'hardBreak' ? '\n' : '')
   }
-  return { text: visit(root, 0).trim().slice(0, 100_000), mentions, ...(Object.keys(routes).length ? { routes } : {}) }
+  const text = visit(root, 0).trim().slice(0, 100_000)
+  return { text, mentions, ...(Object.keys(routes).length ? { routes } : {}),
+    ...(instanceIds.size ? { instanceIds: [...instanceIds].slice(0, 2) } : {}) }
 }

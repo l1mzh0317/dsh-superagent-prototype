@@ -209,6 +209,7 @@ export class MasterAssessor implements Assessor {
     return { trigger_id: trigger.id, strength: candidate.strength, mode: settings.eval.mode,
       source: { kind: trigger.source, actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), ...(trigger.url
         ? { url: trigger.url } : {}) },
+      ...(trigger.source === 'huly' && trigger.meta.resolvedInstance ? { requested_instance: trigger.meta.resolvedInstance } : {}),
       ...cut(trigger.text, TRIGGER_CHARS), ...imageIds(source?.messageId ?? '', trigger.text),
       ...others.length ? { batch: others.map(item => {
         const text = cut(item.text, WINDOW_CHARS)

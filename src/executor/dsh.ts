@@ -119,8 +119,11 @@ const capped = (text: string, limit: number, read: string) =>
  * optional routing note, and a preview of the replied-to message when the worker has not yet seen it.
  */
 export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
+  const instance = trigger.source === 'huly' ? trigger.meta.resolvedInstance : undefined
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
     ...(trigger.newTicket ? { newTicket: true } : {}), ...(trigger.targetTicket ? { targetTicket: trigger.targetTicket } : {}),
+    ...(instance ? { requested_instance: instance,
+      instance_instructions: 'Use the selected endpoint for remote work. For SSH, use the execution environment’s existing SSH configuration or agent. Keep credentials in that environment. If connectivity or authentication fails, report the blocker.' } : {}),
     ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }

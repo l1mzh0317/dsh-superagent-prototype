@@ -61,4 +61,18 @@ describe('Optional Huly mention routing', () => {
     const f = fixture(); f.ticket.channels.push({ source: 'github', address: {} } as never)
     await expect(f.routing.issue('ticket', 'user-token', f.account)).rejects.toMatchObject({ status: 403 })
   })
+  it('binds an Instance to the sending actor before keeping the existing session choice', async () => {
+    const f = fixture()
+    const target = { serviceId: 'service-id', machine: 'Build host', note: '', address: '100.72.0.9', protocol: 'ssh' as const, port: 22 }
+    const requestedTarget = vi.fn().mockResolvedValueOnce(target).mockResolvedValueOnce(undefined)
+    const routing = new HulyRouting(f.runtime, f.client, { requestedTarget })
+    f.input.meta.requestedInstanceIds = [target.serviceId]
+    f.input.meta.peppyRoute = (await routing.issue('ticket', 'user-token', f.account)).route
+    await routing.receive(f.input)
+    expect(requestedTarget).toHaveBeenCalledWith(target.serviceId, f.input.actor.id)
+    expect(f.receive.mock.calls[0]?.[0]).toMatchObject({ targetTicket: 'ticket', meta: { resolvedInstance: target } })
+    await routing.receive(f.input)
+    expect(f.receive.mock.calls[1]?.[0]?.meta).toMatchObject({ routingError: true, instanceSelectionInvalid: true })
+    expect(f.attach).toHaveBeenCalledTimes(1)
+  })
 })

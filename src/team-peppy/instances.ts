@@ -46,6 +46,14 @@ type Grant = GrantInput & {
   id: string; batchId?: string; state: GrantState; updatedAt: string; updatedBy: string
 }
 interface Registry { machines: Machine[]; grants: Grant[]; managers?: string[] }
+export interface InstanceTarget {
+  serviceId: string
+  machine: string
+  note: string
+  address: string
+  port: number
+  protocol: Service['protocol']
+}
 const registryKey = family<Registry>('huly-instances:')
 const workspaceAdmins = new Set(['OWNER', 'ADMIN'])
 const delegatedRoles = new Set(['MAINTAINER', 'USER'])
@@ -118,6 +126,30 @@ export class Instances {
     return [...new Set(registry.grants
       .filter(grant => grant.serviceId === serviceId && grant.state === 'applied')
       .flatMap(grant => grant.members.filter(member => member.account === account.uuid).map(member => member.login)))]
+  }
+
+  private targets(registry: Registry, account: HulyAccount, includeManaged: boolean): InstanceTarget[] {
+    return registry.machines.flatMap(machine => machine.services.flatMap(service =>
+      includeManaged || this.logins(registry, account, service.id).length
+        ? [{ serviceId: service.id, machine: machine.name, note: serviceNote(service),
+          address: machine.address, port: service.port, protocol: service.protocol }]
+        : []))
+  }
+
+  async requestedTarget(serviceId: string, actor: string): Promise<InstanceTarget | undefined> {
+    const social = await this.huly.one('contact:class:SocialIdentity', actor)
+    if (!social || social.isDeleted === true || typeof social.attachedTo !== 'string') return undefined
+    const person = await this.huly.one('contact:class:Person', social.attachedTo)
+    if (typeof person?.personUuid !== 'string') return undefined
+    const roster = await this.huly.workspaceMembers(this.huly.token())
+    const member = roster.find(entry => entry.person === person.personUuid && members.has(entry.role))
+    if (!member) return undefined
+    const registry = this.read()
+    const { machine, service } = this.service(registry, serviceId)
+    const account = { uuid: member.person, role: member.role, socialIds: [actor] }
+    if (!workspaceAdmins.has(member.role) && (!registry.managers?.includes(member.person) ||
+        !await this.eligibleManager(member.person, this.huly.token())) && !this.logins(this.read(), account, serviceId).length) return undefined
+    return { serviceId, machine: machine.name, note: serviceNote(service), address: machine.address, port: service.port, protocol: service.protocol }
   }
 
   private async directory(token: string, accounts?: string[]) {
@@ -235,6 +267,10 @@ export class Instances {
       if (!admin && !logins.length) throw new HulyError(404, '服务不存在或未获授权')
       const { machine, service } = this.service(registry, serviceId)
       return { workspaceUrl: this.huly.deployment.workspaceUrl, address: machine.address, port: service.port, protocol: service.protocol, logins }
+    }
+    if (method === 'GET' && operation === 'targets') {
+      const targets = this.targets(registry, account, admin && query.get('scope') === 'team')
+      return { targets: targets.map(({ address, ...target }) => target) }
     }
     if (!admin) throw new HulyError(403, '需要 Instances 管理权限')
     if (method === 'GET' && operation === 'members') return { members: await this.currentRecipients(token) }

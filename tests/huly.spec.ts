@@ -50,6 +50,17 @@ describe('Huly Source', () => {
     expect(source.scope!(trigger, config)).toMatchObject({ listened: true, observed: true })
     expect(source.scope!(trigger, { ...config, channels: [] })).toMatchObject({ listened: false })
   })
+  it('only requests a registered Instance from a typed same-origin reference on an original mention', () => {
+    const id = '10000000-0000-4000-8000-000000000001'
+    const value = JSON.parse(mention)
+    const link = { type: 'link', attrs: { href: `${d.origin}/workbench/pt?pepper-instance=${id}` } }
+    value.content[0].content.push({ type: 'text', text: 'Build host', marks: [link] })
+    expect(hulyTrigger(message({ message: JSON.stringify(value) }), d, 'channel')!.meta.requestedInstanceIds).toEqual([id])
+    expect(hulyTrigger(message({ message: JSON.stringify(value), editedOn: 2000 }), d, 'channel')!.meta.requestedInstanceIds).toBeUndefined()
+    expect(hulyTrigger(message({ message: textMarkup(link.attrs.href) }), d, 'channel')!.meta.requestedInstanceIds).toBeUndefined()
+    link.attrs.href = link.attrs.href.replace(d.origin, 'https://elsewhere.example')
+    expect(hulyTrigger(message({ message: JSON.stringify(value) }), d, 'channel')!.meta.requestedInstanceIds).toBeUndefined()
+  })
   it('retains the read cursor when ingestion fails, allowing replay', async () => {
     const state = new Map<string, unknown>(), receive = vi.fn().mockRejectedValueOnce(new Error('interrupted')).mockResolvedValue({ stored: true })
     const host = { state: { get: (k: string) => state.get(k), set: (k: string, v: unknown) => state.set(k, v) }, receive,
