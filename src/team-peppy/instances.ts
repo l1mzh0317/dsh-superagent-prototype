@@ -4,6 +4,7 @@ import { z } from 'zod'
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { HulyError, type HulyAccount, type HulyClient } from '../sources/huly-client.ts'
+import { PolicyWriteQueue, type InstancePolicy, type PolicySync } from './tailscale-acl.ts'
 
 const id = z.string().uuid()
 const label = z.string().trim().min(1).max(80)
@@ -38,6 +39,8 @@ const batchInput = z.object({
   serviceIds: z.array(id).min(2).max(30).refine(ids => new Set(ids).size === ids.length),
   members: grantMembers,
 }).strict()
+const grantWriteInput = grantInput.extend({ apply: z.boolean().optional() })
+const batchWriteInput = batchInput.extend({ apply: z.boolean().optional() })
 type GrantInput = z.infer<typeof grantInput>
 type Service = z.infer<typeof serviceInput> & { id: string }
 interface Machine { id: string; name: string; address: string; services: Service[] }
@@ -55,6 +58,7 @@ export interface InstanceTarget {
   protocol: Service['protocol']
 }
 const registryKey = family<Registry>('huly-instances:')
+const grantWrites = new WeakMap<Store, PolicyWriteQueue>()
 const workspaceAdmins = new Set(['OWNER', 'ADMIN'])
 const delegatedRoles = new Set(['MAINTAINER', 'USER'])
 const members = new Set(['OWNER', 'ADMIN', 'MAINTAINER', 'USER'])
@@ -87,10 +91,13 @@ async function runtimeProbe(address: string, port: number): Promise<boolean> {
 /** Workspace service catalog, access grants, and Team Peppy connectivity checks. */
 export class Instances {
   private readonly key
+  private readonly grantQueue
 
   constructor(private readonly store: Store, private readonly huly: HulyClient, private readonly probe = runtimeProbe,
-    private readonly probes = new Map<string, Promise<boolean>>()) {
+    private readonly probes = new Map<string, Promise<boolean>>(), private readonly policySync?: PolicySync) {
     this.key = registryKey(huly.deployment.workspace)
+    this.grantQueue = grantWrites.get(store) ?? new PolicyWriteQueue()
+    grantWrites.set(store, this.grantQueue)
   }
 
   private read(): Registry { return this.store.get(this.key) ?? { machines: [], grants: [] } }
@@ -102,6 +109,41 @@ export class Instances {
       this.store.set(this.key, registry)
       return value
     })
+  }
+
+  private requirePolicy(): PolicySync {
+    if (!this.policySync) throw new HulyError(503, '尚未配置 Tailscale 自动授权')
+    return this.policySync
+  }
+
+  private async changeGrants<T>(authorize: (registry: Registry) => void, change: (registry: Registry) => Promise<T>): Promise<T> {
+    // Hold the shared queue through the policy write and local commit so revocation sees all prior grants.
+    return this.grantQueue.run(async () => {
+      const registry = this.read()
+      authorize(registry)
+      const result = await change(registry)
+      this.update(current => { current.grants = registry.grants })
+      return result
+    })
+  }
+
+  private retainedPolicy(revokedId: string): InstancePolicy {
+    const keep: InstancePolicy = { grants: [], tests: [] }
+    for (const key of this.store.keys(registryKey)) {
+      const registry = this.store.get(key)
+      if (!registry) continue
+      const applied = registry.grants.filter(grant => grant.state === 'applied' && (key !== this.key || grant.id !== revokedId))
+      const policies = this.batchPolicy(registry, applied)
+      keep.grants.push(...policies.grants)
+      keep.tests.push(...policies.tests)
+    }
+    return keep
+  }
+
+  private setGrantState(grant: Grant, state: GrantState, updatedBy: string, updatedAt = new Date().toISOString()): void {
+    grant.state = state
+    grant.updatedAt = updatedAt
+    grant.updatedBy = updatedBy
   }
 
   private service(registry: Registry, serviceId: string) {
@@ -190,7 +232,7 @@ export class Instances {
     }
   }
 
-  private batchPolicy(registry: Registry, inputs: GrantInput[]) {
+  private batchPolicy(registry: Registry, inputs: GrantInput[]): InstancePolicy {
     const policies = inputs.map(input => {
       const { machine, service } = this.service(registry, input.serviceId)
       return policy(input, machine.address, service.port)
@@ -228,13 +270,13 @@ export class Instances {
     if (method !== 'POST') throw new HulyError(404, 'Unknown Instances operation')
     const { account, enabled } = z.object({ account: id, enabled: z.boolean() }).strict().parse(await readBody())
     if (enabled && !await this.eligibleManager(account, token)) throw new HulyError(400, '请选择当前工作区的成员或维护者')
-    return this.update(current => {
+    return this.grantQueue.run(() => this.update(current => {
       const managers = new Set(current.managers)
       if (enabled) managers.add(account)
       else managers.delete(account)
       current.managers = [...managers]
       return { managers: current.managers, botAccount }
-    })
+    }))
   }
 
   async handle(operation: string, method: string | undefined, query: URLSearchParams, readBody: () => Promise<unknown>, token: string, account: HulyAccount): Promise<unknown> {
@@ -259,7 +301,7 @@ export class Instances {
         })
         return admin || services.length ? [{ ...machine, services }] : []
       })
-      return { admin, machines, grants: admin ? registry.grants : [] }
+      return { admin, autoApply: this.policySync !== undefined, machines, grants: admin ? registry.grants : [] }
     }
     if (method === 'GET' && operation === 'connection') {
       const serviceId = id.parse(query.get('service'))
@@ -278,9 +320,12 @@ export class Instances {
     if (method === 'GET' && operation === 'members') return { members: await this.currentRecipients(token) }
     if (method !== 'POST') throw new HulyError(404, 'Unknown Instances operation')
 
-    const updateManaged = <T>(apply: (current: Registry) => T): T => this.update(current => {
-      // A grant could be withdrawn while an already authorized request reads its body or validates members.
+    const authorize = (current: Registry) => {
+      // Management access can change while an authorized request reads its body or validates members.
       if (!workspaceAdmin && !current.managers?.includes(account.uuid)) throw new HulyError(403, 'Instances 管理权限已撤销')
+    }
+    const updateManaged = <T>(apply: (current: Registry) => T): T => this.update(current => {
+      authorize(current)
       return apply(current)
     })
     const data = await readBody()
@@ -323,21 +368,24 @@ export class Instances {
       }
       case 'preview':
       case 'grants': {
-        const value = grantInput.parse(data)
+        const { apply, ...value } = operation === 'grants' ? grantWriteInput.parse(data) : { ...grantInput.parse(data), apply: false }
         const { machine, service } = this.service(registry, value.serviceId)
         await this.validateRecipients(value.members, token)
         if (operation === 'preview') return policy(value, machine.address, service.port)
-        return updateManaged(current => {
+        return this.changeGrants(authorize, async current => {
           const pending = this.pendingGrant(current, value)
-          if (pending) return { id: pending.id }
-          const grant: Grant = { ...value, id: randomUUID(), state: 'pending', updatedAt: new Date().toISOString(), updatedBy: account.uuid }
-          current.grants.push(grant)
-          return { id: grant.id }
+          const grant: Grant = pending ?? { ...value, id: randomUUID(), state: 'pending', updatedAt: new Date().toISOString(), updatedBy: account.uuid }
+          if (apply) {
+            await this.requirePolicy().apply(this.batchPolicy(current, [grant]))
+            this.setGrantState(grant, 'applied', account.uuid)
+          }
+          if (!pending) current.grants.push(grant)
+          return apply ? { id: grant.id, state: grant.state } : { id: grant.id }
         })
       }
       case 'preview-batch':
       case 'grant-batch': {
-        const { serviceIds, members } = batchInput.parse(data)
+        const { serviceIds, members, apply } = operation === 'grant-batch' ? batchWriteInput.parse(data) : { ...batchInput.parse(data), apply: false }
         await this.validateRecipients(members, token)
         const inputs = serviceIds.map(serviceId => ({ serviceId, members }))
         if (operation === 'preview-batch') {
@@ -345,23 +393,28 @@ export class Instances {
           for (const input of inputs) this.pendingGrant(registry, input)
           return preview
         }
-        return updateManaged(current => {
+        return this.changeGrants(authorize, async current => {
           for (const input of inputs) this.service(current, input.serviceId)
           const pending = inputs.flatMap(input => {
             const grant = this.pendingGrant(current, input)
             return grant ? [grant] : []
           })
-          if (pending.length) {
-            const batchId = pending[0]!.batchId
-            if (batchId && pending.length === inputs.length && pending.every(grant => grant.batchId === batchId) &&
-              this.batchGrants(current, batchId).length === inputs.length) return { id: batchId }
+          const batchId = pending.length ? pending[0]!.batchId : randomUUID()
+          if (!batchId || (pending.length > 0 && (pending.length !== inputs.length ||
+            pending.some(grant => grant.batchId !== batchId) || this.batchGrants(current, batchId).length !== inputs.length))) {
             throw new HulyError(409, '部分服务已有待应用授权，请先在服务授权中处理')
           }
-          const id = randomUUID(), updatedAt = new Date().toISOString()
-          current.grants.push(...inputs.map(input => ({
-            ...input, id: randomUUID(), batchId: id, state: 'pending' as const, updatedAt, updatedBy: account.uuid,
-          })))
-          return { id }
+          if (apply) await this.requirePolicy().apply(this.batchPolicy(current, inputs))
+          const updatedAt = new Date().toISOString()
+          const state = apply ? 'applied' : 'pending'
+          if (!pending.length) {
+            current.grants.push(...inputs.map((input): Grant => ({
+              ...input, id: randomUUID(), batchId, state, updatedAt, updatedBy: account.uuid,
+            })))
+          } else if (apply) {
+            for (const grant of pending) this.setGrantState(grant, state, account.uuid, updatedAt)
+          }
+          return apply ? { id: batchId, state } : { id: batchId }
         })
       }
       case 'batch-policy': {
@@ -371,22 +424,18 @@ export class Instances {
         return this.batchPolicy(registry, pending)
       }
       case 'batch-state': {
-        const { batchId, action } = z.object({ batchId: id, action: z.enum(['confirm', 'discard']) }).strict().parse(data)
-        const pending = this.batchGrants(registry, batchId).find(grant => grant.state === 'pending')
-        if (action === 'confirm' && pending) await this.validateRecipients(pending.members, token)
-        return updateManaged(current => {
+        const { batchId, action } = z.object({ batchId: id, action: z.enum(['confirm', 'discard', 'apply']) }).strict().parse(data)
+        return this.changeGrants(authorize, async current => {
           const grants = this.batchGrants(current, batchId)
-          const next = action === 'confirm' ? 'applied' : 'revoked'
-          if (grants.some(grant => grant.state !== 'pending' && grant.state !== next)) {
+          const pending = grants.filter(grant => grant.state === 'pending')
+          if (pending.length && action !== 'discard') await this.validateRecipients(pending[0]!.members, token)
+          const next = action === 'discard' ? 'revoked' : 'applied'
+          if ((action !== 'apply' || !pending.length) && grants.some(grant => grant.state !== 'pending' && grant.state !== next)) {
             throw new HulyError(409, '这批授权的状态已变化，请刷新后分别处理')
           }
+          if (pending.length && action === 'apply') await this.requirePolicy().apply(this.batchPolicy(current, pending))
           const now = new Date().toISOString()
-          for (const grant of grants) {
-            if (grant.state === next) continue
-            grant.state = next
-            grant.updatedAt = now
-            grant.updatedBy = account.uuid
-          }
+          for (const grant of pending) this.setGrantState(grant, next, account.uuid, now)
           return { state: next }
         })
       }
@@ -398,19 +447,33 @@ export class Instances {
         return policy(grant, machine.address, service.port, grant.state === 'revoking' || grant.state === 'revoked')
       }
       case 'grant-state': {
-        const value = z.object({ grantId: id, action: z.enum(['confirm', 'revoke', 'confirm-revoked', 'discard']) }).strict().parse(data)
-        return updateManaged(current => {
-          const grant = current.grants.find(g => g.id === value.grantId)
+        const { grantId, action } = z.object({
+          grantId: id, action: z.enum(['confirm', 'revoke', 'confirm-revoked', 'discard', 'apply', 'revoke-auto']),
+        }).strict().parse(data)
+        return this.changeGrants(authorize, async current => {
+          const grant = current.grants.find(g => g.id === grantId)
           if (!grant) throw new HulyError(404, '授权不存在')
-          const transitions = { confirm: ['pending', 'applied'], revoke: ['applied', 'revoking'], 'confirm-revoked': ['revoking', 'revoked'], discard: ['pending', 'revoked'] } as const
-          const [previous, next] = transitions[value.action]
-          if (grant.state !== next) {
-            if (grant.state !== previous) throw new HulyError(409, '授权状态已变化，请刷新')
-            grant.state = next
-            grant.updatedAt = new Date().toISOString()
-            grant.updatedBy = account.uuid
+          const transitions = {
+            confirm: ['applied', 'pending'],
+            revoke: ['revoking', 'applied'],
+            'confirm-revoked': ['revoked', 'revoking'],
+            discard: ['revoked', 'pending'],
+            apply: ['applied', 'pending'],
+            'revoke-auto': ['revoked', 'applied', 'revoking'],
+          } as const
+          const [next, ...previous] = transitions[action]
+          const allowed: readonly GrantState[] = previous
+          if (grant.state === next) return { state: next }
+          if (!allowed.includes(grant.state)) throw new HulyError(409, '授权状态已变化，请刷新')
+          if (action === 'apply') {
+            const sync = this.requirePolicy()
+            await this.validateRecipients(grant.members, token)
+            await sync.apply(this.batchPolicy(current, [grant]))
+          } else if (action === 'revoke-auto') {
+            await this.requirePolicy().remove(this.batchPolicy(current, [grant]), this.retainedPolicy(grant.id))
           }
-          return { state: grant.state }
+          this.setGrantState(grant, next, account.uuid)
+          return { state: next }
         })
       }
       default: throw new HulyError(404, 'Unknown Instances operation')

@@ -11,6 +11,7 @@ import { workerSessionId } from '../executor/dsh.ts'
 import { HULY, HulyClient, HulyError, type HulyAccount } from '../sources/huly-client.ts'
 import { contextView } from './context.ts'
 import { Instances } from './instances.ts'
+import { tailscalePolicyFromEnv, type PolicySync } from './tailscale-acl.ts'
 import { HulyRouting, hulyDiscussionTitle, hulyMayChoose, hulyTaskSources, mayReadHulyTask, mayWriteHulyTask } from '../sources/huly-routing.ts'
 import { hulyInputState, hulyMessageStatus, statusCutover } from '../sources/huly-feedback.ts'
 
@@ -66,11 +67,12 @@ export function publicStreamText(records: readonly unknown[] = []): string {
     return r.type === 'chunk' && r.chunk?.type === 'text-delta' && typeof r.chunk.text === 'string' ? [r.chunk.text] : []
   }).join('')
 }
-export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClient, routing = new HulyRouting(runtime, huly)): () => void {
+export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClient,
+  routing = new HulyRouting(runtime, huly), policySync: PolicySync | undefined = tailscalePolicyFromEnv()): () => void {
   const d = huly.deployment
   // Request-scoped handlers share the runtime's in-flight probe budget.
   const instanceProbes = new Map<string, Promise<boolean>>()
-  const instances = new Instances(runtime.store, huly, undefined, instanceProbes)
+  const instances = new Instances(runtime.store, huly, undefined, instanceProbes, policySync)
   if (!runtime.store.get(statusCutover(d.workspace))) runtime.store.set(statusCutover(d.workspace), new Date().toISOString())
   const allowedChannels = () => runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels ?? []
   const mayRead = (ticket: Ticket, token: string) => mayReadHulyTask(runtime, huly, ticket, token)
@@ -115,7 +117,7 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
       }
       if (scopedInstances || legacyInstances) {
         const op = scopedInstances?.[2] ?? legacyInstances?.[1] ?? ''
-        const workspaceInstances = workspaceHuly === huly ? instances : new Instances(runtime.store, workspaceHuly, undefined, instanceProbes)
+        const workspaceInstances = workspaceHuly === huly ? instances : new Instances(runtime.store, workspaceHuly, undefined, instanceProbes, policySync)
         json(res, 200, await workspaceInstances.handle(op, req.method, url.searchParams, () => body(req), token, account))
         return
       }

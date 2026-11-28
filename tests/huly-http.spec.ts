@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
@@ -9,6 +9,7 @@ import type { Runtime } from '../src/app/runtime.ts'
 import type { Ticket } from '../src/core/index.ts'
 import { HulyClient, type HulyDeployment } from '../src/sources/huly-client.ts'
 import { registerTeamPeppy } from '../src/team-peppy/http.ts'
+import { tailscalePolicyFromEnv, type InstancePolicy, type PolicySync } from '../src/team-peppy/tailscale-acl.ts'
 
 vi.mock('node:net', async importOriginal => {
   const net = await importOriginal<typeof import('node:net')>()
@@ -16,9 +17,15 @@ vi.mock('node:net', async importOriginal => {
 })
 
 const servers: Server[] = []
-afterEach(async () => { for (const s of servers.splice(0)) { s.closeAllConnections(); await new Promise<void>(r => s.close(() => r())) } })
+beforeEach(() => {
+  for (const name of ['TAILSCALE_OAUTH_CLIENT_ID', 'TAILSCALE_API_KEY', 'TAILSCALE_API_KEY_FILE']) vi.stubEnv(name, undefined)
+})
+afterEach(async () => {
+  vi.unstubAllEnvs()
+  for (const s of servers.splice(0)) { s.closeAllConnections(); await new Promise<void>(r => s.close(() => r())) }
+})
 const workspaceToken = (workspace: string) => 'header.' + Buffer.from(JSON.stringify({ workspace })).toString('base64url') + '.sig'
-async function fixture(request?: typeof fetch, overrides?: Partial<HulyDeployment>) {
+async function fixture(request?: typeof fetch, overrides?: Partial<HulyDeployment>, policySync?: PolicySync) {
   const deployment: HulyDeployment = { workspace: 'a', workspaceUrl: 'pt', origin: 'https://huly.example', endpoint: '', tokenFile: '', botPerson: '', botSocial: '', botAccount: '', channels: ['c'], operators: ['owner'], ...overrides }
   const ticket = { id: 'task', title: 'Investigate', decisionId: 'decision', mandate: { actor: { source: 'huly', id: 'author-social' } },
     channels: [{ source: 'huly', thread: 'a:c:root', address: { workspace: 'a', channelId: 'c', rootId: 'root' } }],
@@ -43,9 +50,9 @@ async function fixture(request?: typeof fetch, overrides?: Partial<HulyDeploymen
   const threadMessages = vi.fn(() => [] as import('../src/core/index.ts').Trigger[])
   const values = new Map<string, unknown>()
   const runtime = { ready: Promise.resolve(), configured: () => true, sources: { instance: () => ({ config: { channels: ['c'] } }) },
-    store: { get: (key: string) => values.get(key), set: (key: string, value: unknown) => values.set(key, value), read: { messageTriggers, hulyThreadMessages: threadMessages, hulyDiscussionRoots: discussionRoots, hulyDiscussionMessages: () => [] }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
+    store: { get: (key: string) => structuredClone(values.get(key)), keys: ({ prefix }: { prefix: string }) => [...values.keys()].filter(key => key.startsWith(prefix)), set: (key: string, value: unknown) => values.set(key, value), read: { messageTriggers, hulyThreadMessages: threadMessages, hulyDiscussionRoots: discussionRoots, hulyDiscussionMessages: () => [] }, settings: () => ({ policy: { sources: { huly: { allowed: [{ id: 'author-social' }] } } } }), decisions: { get: () => undefined }, atomic: (f: () => unknown) => f(), triggers: { get: (id: string) => triggers.get(id), disposition },
       tickets: { list: () => [ticket], get: (id: string) => id === 'task' ? ticket : undefined } }, engine: { receive, attach }, passes: { request: vi.fn() } } as unknown as Runtime
-  registerTeamPeppy(ctx, runtime, huly)
+  registerTeamPeppy(ctx, runtime, huly, undefined, policySync)
   const server = createServer((req, res) => { void handler(req, res) }); servers.push(server)
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
   const token = workspaceToken(deployment.workspace)
@@ -203,7 +210,7 @@ describe('workspace Instances', () => {
     const callOther = (op = '', data?: unknown, headers = {}) => f.callPath(path + op, data, { ...auth, ...headers })
     const empty = await callOther()
     expect(empty.status).toBe(200)
-    expect(await empty.json()).toEqual({ admin: true, machines: [], grants: [] })
+    expect(await empty.json()).toEqual({ admin: true, autoApply: false, machines: [], grants: [] })
     const host = { name: 'Other server', address: '100.71.0.1', service: { protocol: 'ssh', port: 22 } }
     expect((await callOther('/machines', host, { origin: 'https://foreign.test' })).status).toBe(403)
     expect((await callOther('/machines', host, { 'x-team-peppy-request': '' })).status).toBe(403)
@@ -287,7 +294,7 @@ describe('workspace Instances', () => {
     const grantId = grant.id
 
     identity('alice', 'USER')
-    expect(await (await f.call('instances')).json()).toEqual({ admin: false, machines: [], grants: [] })
+    expect(await (await f.call('instances')).json()).toEqual({ admin: false, autoApply: false, machines: [], grants: [] })
     expect(await (await f.call('instances/targets?scope=team')).json()).toEqual({ targets: [] })
     expect((await f.call(query)).status).toBe(404)
     expect((await f.call('instances/grant-state', { grantId, action: 'confirm' })).status).toBe(403)
@@ -440,7 +447,7 @@ describe('workspace Instances', () => {
     identity('owner', 'OWNER')
     expect(await (await f.call('instances/managers', { ...change, enabled: false })).json()).toMatchObject({ managers: [] })
     identity(delegate, 'USER')
-    expect(await (await f.call('instances')).json()).toEqual({ admin: false, machines: [], grants: [] })
+    expect(await (await f.call('instances')).json()).toEqual({ admin: false, autoApply: false, machines: [], grants: [] })
     expect((await f.call('instances/machines', machine)).status).toBe(403)
   })
 
@@ -558,5 +565,174 @@ describe('workspace Instances', () => {
     expect((await f.call('instances/machines', request)).status).toBe(200)
     f.account.mockResolvedValue({ uuid: 'guest', role: 'GUEST', socialIds: ['guest'] })
     expect((await f.call('instances')).status).toBe(403)
+  })
+})
+
+describe('one-click Instances policy sync', () => {
+  const alice = { account: 'alice', login: 'alice@example.test' }
+  const address = '100.70.0.9'
+  const dest = address + ':443'
+  const accept = { src: alice.login, proto: 'tcp', accept: [dest] }
+
+  function policyApi() {
+    let policy: InstancePolicy = { grants: [], tests: [] }
+    const write = vi.fn<(body: InstancePolicy) => void>()
+    const request = vi.fn<typeof fetch>(async (_url, init) => {
+      if (init?.method === 'GET') return Response.json(policy)
+      const updated = JSON.parse(String(init?.body)) as InstancePolicy
+      try { write(updated) }
+      catch { return new Response('private upstream details', { status: 403 }) }
+      policy = updated
+      return new Response(null, { status: 204 })
+    })
+    return {
+      sync: tailscalePolicyFromEnv({ TAILSCALE_API_KEY: 'test-key' }, request)!,
+      write, current: () => policy,
+    }
+  }
+
+  async function catalogWithServices(policySync: PolicySync | undefined, ports: number[]) {
+    const f = await fixture(undefined, undefined, policySync)
+    f.account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: [] })
+    f.directory.mockResolvedValue([{ personUuid: alice.account, name: 'Alice' }] as never)
+    f.workspaceMembers.mockResolvedValue([{ person: alice.account, role: 'USER' }])
+    const services = ports.map(port => ({ id: randomUUID(), protocol: 'https', port }))
+    f.values.set('huly-instances:a', { machines: [{ id: randomUUID(), name: 'Server', address, services }], grants: [] })
+    const call = (op = '', data?: unknown) => f.call('instances' + op, data)
+    const catalog = async () => (await call()).json()
+    return { call, catalog, ids: services.map(service => service.id) }
+  }
+
+  it('reports automatic availability and keeps manual staging when credentials are absent', async () => {
+    const f = await catalogWithServices(undefined, [443])
+    expect(await f.catalog()).toMatchObject({ admin: true, autoApply: false, grants: [] })
+    const draft = { serviceId: f.ids[0], members: [alice] }
+    expect((await f.call('/grants', { ...draft, apply: true })).status).toBe(503)
+    expect((await f.catalog()).grants).toEqual([])
+    const response = await f.call('/grants', { ...draft, apply: false })
+    expect(response.status).toBe(200)
+    const { id } = await response.json()
+    expect(await f.catalog()).toMatchObject({ grants: [{ id, ...draft, state: 'pending' }] })
+  })
+
+  it('applies a grant and a batch directly and applies the pending portion of a staged batch', async () => {
+    const api = policyApi()
+    const f = await catalogWithServices(api.sync, [443, 8001, 8002, 8003, 8004])
+    expect(await f.catalog()).toMatchObject({ admin: true, autoApply: true, grants: [] })
+    const result = await f.call('/grants', { serviceId: f.ids[0], members: [alice], group: 'group:build', apply: true })
+    expect(result.status).toBe(200)
+    const { id: grantId, state } = await result.json()
+    expect(state).toBe('applied')
+    expect(api.write).toHaveBeenCalledExactlyOnceWith({
+      grants: [{ src: ['group:build'], dst: [address], ip: ['tcp:443'] }], tests: [accept],
+    })
+
+    const direct = await f.call('/grant-batch', { serviceIds: f.ids.slice(1, 3), members: [alice], apply: true })
+    expect(direct.status).toBe(200)
+    const batch = await direct.json()
+    expect(batch).toEqual({ id: expect.any(String), state: 'applied' })
+    const batchId = batch.id
+    expect(api.write).toHaveBeenCalledTimes(2)
+    expect(api.current().grants.map(rule => rule.ip[0])).toEqual(['tcp:443', 'tcp:8001', 'tcp:8002'])
+    expect(api.current().tests[1]).toEqual({ src: alice.login, proto: 'tcp', accept: [address + ':8001', address + ':8002'] })
+    expect((await f.catalog()).grants).toMatchObject([{ id: grantId, state: 'applied' },
+      { batchId, state: 'applied' }, { batchId, state: 'applied' }])
+
+    const staged = await f.call('/grant-batch', { serviceIds: f.ids.slice(3), members: [alice] })
+    expect(staged.status).toBe(200)
+    const { id: stagedBatchId } = await staged.json()
+    const stagedGrantId = (await f.catalog()).grants[3].id
+    for (let i = 0; i < 2; i++) {
+      expect(await (await f.call('/grant-state', { grantId: stagedGrantId, action: 'apply' })).json()).toEqual({ state: 'applied' })
+    }
+    expect(api.write).toHaveBeenCalledTimes(3)
+    expect(await (await f.call('/batch-state', { batchId: stagedBatchId, action: 'apply' })).json()).toEqual({ state: 'applied' })
+    expect(api.write).toHaveBeenCalledTimes(4)
+    expect(api.current().grants.map(rule => rule.ip[0])).toEqual(['tcp:443', 'tcp:8001', 'tcp:8002', 'tcp:8003', 'tcp:8004'])
+    expect((await f.catalog()).grants.map((grant: { state: string }) => grant.state)).toEqual(Array(5).fill('applied'))
+  })
+
+  it('preserves shared rules and accept pairs across workspace registries until their last applied grant is revoked', async () => {
+    const api = policyApi()
+    const other = randomUUID(), third = randomUUID()
+    const endpoint = 'https://transactor.example'
+    const accountsEndpoint = 'https://accounts.example/rpc'
+    const request = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).startsWith(endpoint + '/api/v1/account/')) return Response.json({ uuid: 'owner', role: 'ADMIN', socialIds: ['owner-social'] })
+      if (String(url).startsWith(endpoint + '/api/v1/find-all/')) return Response.json([{ personUuid: alice.account, name: 'Alice' }])
+      if (url === accountsEndpoint && JSON.parse(String(init?.body)).method === 'getWorkspaceMembers') {
+        return Response.json({ result: [{ person: alice.account, role: 'USER' }] })
+      }
+      return new Response(null, { status: 404 })
+    })
+    const f = await fixture(request, { endpoint, accountsEndpoint }, api.sync)
+    f.account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: [] })
+    f.directory.mockResolvedValue([{ personUuid: alice.account, name: 'Alice' }] as never)
+    f.workspaceMembers.mockResolvedValue([{ person: alice.account, role: 'USER' }])
+    const call = (workspace: string, op = '', data?: unknown) => workspace === 'a'
+      ? f.call('instances' + op, data)
+      : f.callPath(`workspaces/${workspace}/api/instances${op}`, data, { authorization: 'Bearer ' + workspaceToken(workspace) })
+    const grantIds: Record<string, string> = {}
+    for (const workspace of ['a', other, third]) {
+      const serviceId = randomUUID()
+      f.values.set('huly-instances:' + workspace, {
+        machines: [{ id: randomUUID(), name: 'Server', address, services: [{ id: serviceId, protocol: 'https', port: 443 }] }], grants: [],
+      })
+      expect(await (await call(workspace)).json()).toMatchObject({ admin: true, autoApply: true })
+      const created = await call(workspace, '/grants', {
+        serviceId, members: [alice], group: workspace === third ? 'group:other' : 'group:build', apply: true,
+      })
+      expect(created.status).toBe(200)
+      grantIds[workspace] = (await created.json()).id
+    }
+    const revoke = async (workspace: string) => {
+      const response = await call(workspace, '/grant-state', { grantId: grantIds[workspace], action: 'revoke-auto' })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({ state: 'revoked' })
+    }
+    await Promise.all([revoke('a'), revoke(other)])
+    const firstRemoval = api.write.mock.calls[3]![0]
+    expect(firstRemoval.grants.map(rule => rule.src[0])).toEqual(['group:build', 'group:other'])
+    expect(firstRemoval.tests).toEqual([accept])
+    expect(api.current().grants.map(rule => rule.src[0])).toEqual(['group:other'])
+    expect(api.current().tests).toEqual([accept])
+    await revoke('a')
+    expect(api.write).toHaveBeenCalledTimes(5)
+    expect((await call(third, '/grant-state', { grantId: grantIds[third], action: 'revoke' })).status).toBe(200)
+    await revoke(third)
+    expect(api.current()).toEqual({ grants: [], tests: [] })
+  })
+
+  it('leaves new, pending and applied records unchanged when policy writes fail', async () => {
+    const api = policyApi()
+    const f = await catalogWithServices(api.sync, [443, 8001, 8002])
+    const single = { serviceId: f.ids[0], members: [alice] }
+    const batch = { serviceIds: f.ids.slice(1), members: [alice] }
+    api.write.mockImplementation(() => { throw new Error('denied') })
+    const fail = async (op: string, request: unknown) => {
+      const before = await f.catalog()
+      const response = await f.call(op, request)
+      expect(response.status).toBe(502)
+      expect(await response.json()).toEqual({ error: 'Tailscale 策略更新失败（HTTP 403）' })
+      expect(await f.catalog()).toEqual(before)
+    }
+    await fail('/grants', { ...single, apply: true })
+    await fail('/grant-batch', { ...batch, apply: true })
+    const { id: grantId } = await (await f.call('/grants', single)).json()
+    const { id: batchId } = await (await f.call('/grant-batch', batch)).json()
+    await fail('/grants', { ...single, apply: true })
+    await fail('/grant-batch', { ...batch, apply: true })
+    await fail('/grant-state', { grantId, action: 'apply' })
+    await fail('/batch-state', { batchId, action: 'apply' })
+    api.write.mockReset()
+    expect((await f.call('/grant-state', { grantId, action: 'apply' })).status).toBe(200)
+    api.write.mockImplementation(() => { throw new Error('denied') })
+    await fail('/grant-state', { grantId, action: 'revoke-auto' })
+    expect(api.current().tests).toEqual([accept])
+
+    api.write.mockReset()
+    expect(await (await f.call('/grant-batch', { ...batch, apply: true })).json()).toEqual({ id: batchId, state: 'applied' })
+    expect((await f.catalog()).grants).toMatchObject([{ id: grantId, state: 'applied' },
+      { batchId, state: 'applied' }, { batchId, state: 'applied' }])
   })
 })

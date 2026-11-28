@@ -375,6 +375,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/huly-feedback.ts` | Read-only message-header status derived from native task state and explicit-mention answer reminders |
 | `src/team-peppy/http.ts` | Huly-authenticated task views and original worker Session read, input and cancellation |
 | `src/team-peppy/instances.ts` | Workspace service catalog, access grants and TCP checks from the Team Peppy runtime |
+| `src/team-peppy/tailscale-acl.ts` | Authenticated Tailscale policy updates with ETag retries |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
@@ -419,7 +420,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/huly-feedback.spec.ts` | Quiet native intake, status/session projection, substantive-answer reminders and footer-free replies |
 | `tests/huly-ui.spec.ts` | Reply deep links, queued session allocation and progress visibility in the real dashboard script |
 | `tests/huly-routing.spec.ts` | Optional member choices, original-task attachment, live permission revocation and forged-choice refusal |
-| `tests/huly-http.spec.ts` | Worker Session binding, authenticated inputs, channel access and CSRF |
+| `tests/huly-http.spec.ts` | Worker Session binding, authenticated inputs, channel access, CSRF and workspace Instances policy sync |
+| `tests/tailscale-acl.spec.ts` | Tailscale credentials, ETag retries, policy updates, shared access and error sanitization |
 | `tests/huly-message-query.spec.ts` | Exact message/workspace scoping and preserving original human intake across later edits |
 | `tests/huly-mode.spec.ts` | Huly-only startup without a fabricated GitHub identity or credential helper |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
