@@ -22,6 +22,9 @@ export class HulyError extends Error { constructor(readonly status: number, mess
 /** Calls Huly with the service member or an authenticated reader's own token. */
 export class HulyClient {
   constructor(readonly deployment: HulyDeployment, private readonly request: typeof fetch = fetch) {}
+  forWorkspace(workspace: string, workspaceUrl = ''): HulyClient {
+    return new HulyClient({ ...this.deployment, workspace, workspaceUrl }, this.request)
+  }
   token(): string { return readFileSync(this.deployment.tokenFile, 'utf8').trim() }
   async api(path: string, token = this.token(), body?: unknown): Promise<unknown> {
     const res = await this.request(`${this.deployment.endpoint.replace(/\/$/, '')}/api/v1/${path}/${encodeURIComponent(this.deployment.workspace)}`, {
@@ -52,6 +55,21 @@ export class HulyClient {
     const a = await this.api('account', token) as HulyAccount
     if (!a.uuid || !Array.isArray(a.socialIds) || !a.socialIds.length) throw new HulyError(401, 'Huly login required')
     return a
+  }
+  async workspaceInfo(token: string): Promise<{ uuid: string; url: string }> {
+    const url = this.deployment.accountsEndpoint || new URL('/_accounts', this.deployment.origin)
+    const res = await this.request(url, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ method: 'getWorkspaceInfo', params: {} }), redirect: 'error', signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) throw new HulyError(502, '暂时无法读取 Huly 工作区信息')
+    const response = await res.json() as { result?: { uuid?: unknown; url?: unknown }; error?: unknown } | null
+    const result = response?.result
+    if (response?.error || result?.uuid !== this.deployment.workspace ||
+      typeof result.url !== 'string' || result.url.length === 0 || result.url.length > 200) {
+      throw new HulyError(502, '暂时无法读取 Huly 工作区信息')
+    }
+    return { uuid: result.uuid, url: result.url }
   }
   async workspaceMembers(token: string): Promise<HulyWorkspaceMember[]> {
     const url = this.deployment.accountsEndpoint || new URL('/_accounts', this.deployment.origin)

@@ -68,7 +68,9 @@ export function publicStreamText(records: readonly unknown[] = []): string {
 }
 export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClient, routing = new HulyRouting(runtime, huly)): () => void {
   const d = huly.deployment
-  const instances = new Instances(runtime.store, huly)
+  // Request-scoped handlers share the runtime's in-flight probe budget.
+  const instanceProbes = new Map<string, Promise<boolean>>()
+  const instances = new Instances(runtime.store, huly, undefined, instanceProbes)
   if (!runtime.store.get(statusCutover(d.workspace))) runtime.store.set(statusCutover(d.workspace), new Date().toISOString())
   const allowedChannels = () => runtime.sources.instance<{ channels: string[] }>('huly')?.config.channels ?? []
   const mayRead = (ticket: Ticket, token: string) => mayReadHulyTask(runtime, huly, ticket, token)
@@ -93,7 +95,12 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
     }
     try {
       await runtime.ready
-      const token = requestToken(req, d.workspace), account = await huly.account(token)
+      const scopedInstances = path.match(/^\/workspaces\/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\/api\/instances(?:\/([a-z-]+))?$/)
+      const legacyInstances = path.match(/^\/api\/instances(?:\/([a-z-]+))?$/)
+      const targetWorkspace = scopedInstances?.[1]?.toLowerCase() ?? d.workspace
+      const token = requestToken(req, targetWorkspace)
+      const workspaceHuly = targetWorkspace === d.workspace ? huly : huly.forWorkspace(targetWorkspace, '')
+      const account = await workspaceHuly.account(token)
       if (req.method !== 'GET') {
         const fetchSite = req.headers['sec-fetch-site']
         // Electron's session.fetch forwards the explicit bearer but emits Sec-Fetch-Site: none.
@@ -106,9 +113,10 @@ export function registerTeamPeppy(ctx: Context, runtime: Runtime, huly: HulyClie
           throw new HulyError(403, '无法验证请求，请重试')
         }
       }
-      const instanceOperation = path.match(/^\/api\/instances(?:\/([a-z-]+))?$/)
-      if (instanceOperation) {
-        json(res, 200, await instances.handle(instanceOperation[1] ?? '', req.method, url.searchParams, () => body(req), token, account))
+      if (scopedInstances || legacyInstances) {
+        const op = scopedInstances?.[2] ?? legacyInstances?.[1] ?? ''
+        const workspaceInstances = workspaceHuly === huly ? instances : new Instances(runtime.store, workspaceHuly, undefined, instanceProbes)
+        json(res, 200, await workspaceInstances.handle(op, req.method, url.searchParams, () => body(req), token, account))
         return
       }
       if (path === '/api/status' && req.method === 'GET') { json(res, 200, { workspace: d.workspace, workspaceUrl: d.workspaceUrl, connected: runtime.configured(), account: account.uuid, botPerson: d.botPerson }); return }

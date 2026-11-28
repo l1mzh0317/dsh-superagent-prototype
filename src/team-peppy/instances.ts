@@ -87,9 +87,9 @@ async function runtimeProbe(address: string, port: number): Promise<boolean> {
 /** Workspace service catalog, access grants, and Team Peppy connectivity checks. */
 export class Instances {
   private readonly key
-  private readonly probes = new Map<string, Promise<boolean>>()
 
-  constructor(private readonly store: Store, private readonly huly: HulyClient, private readonly probe = runtimeProbe) {
+  constructor(private readonly store: Store, private readonly huly: HulyClient, private readonly probe = runtimeProbe,
+    private readonly probes = new Map<string, Promise<boolean>>()) {
     this.key = registryKey(huly.deployment.workspace)
   }
 
@@ -266,7 +266,9 @@ export class Instances {
       const logins = this.logins(registry, account, serviceId)
       if (!admin && !logins.length) throw new HulyError(404, '服务不存在或未获授权')
       const { machine, service } = this.service(registry, serviceId)
-      return { workspaceUrl: this.huly.deployment.workspaceUrl, address: machine.address, port: service.port, protocol: service.protocol, logins }
+      // Resolve dynamic workspace URLs with the caller's token so renames take effect immediately.
+      const workspaceUrl = this.huly.deployment.workspaceUrl || (await this.huly.workspaceInfo(token)).url
+      return { workspaceUrl, address: machine.address, port: service.port, protocol: service.protocol, logins }
     }
     if (method === 'GET' && operation === 'targets') {
       const targets = this.targets(registry, account, admin && query.get('scope') === 'team')
@@ -310,11 +312,12 @@ export class Instances {
       case 'probe': {
         const value = z.object({ serviceId: id }).strict().parse(data)
         const { machine, service } = this.service(registry, value.serviceId)
-        let check = this.probes.get(service.id)
+        const probeKey = `${this.huly.deployment.workspace}:${service.id}`
+        let check = this.probes.get(probeKey)
         if (!check) {
           if (this.probes.size >= 8) throw new HulyError(429, '连接检查繁忙，请重试')
-          check = this.probe(machine.address, service.port).finally(() => this.probes.delete(service.id))
-          this.probes.set(service.id, check)
+          check = this.probe(machine.address, service.port).finally(() => this.probes.delete(probeKey))
+          this.probes.set(probeKey, check)
         }
         return { reachable: await check, checkedAt: new Date().toISOString() }
       }

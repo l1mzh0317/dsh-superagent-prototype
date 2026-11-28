@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import { connect, createConnection } from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Runtime } from '../src/app/runtime.ts'
@@ -15,12 +17,13 @@ vi.mock('node:net', async importOriginal => {
 
 const servers: Server[] = []
 afterEach(async () => { for (const s of servers.splice(0)) { s.closeAllConnections(); await new Promise<void>(r => s.close(() => r())) } })
-async function fixture() {
-  const deployment: HulyDeployment = { workspace: 'a', workspaceUrl: 'pt', origin: 'https://huly.example', endpoint: '', tokenFile: '', botPerson: '', botSocial: '', botAccount: '', channels: ['c'], operators: ['owner'] }
+const workspaceToken = (workspace: string) => 'header.' + Buffer.from(JSON.stringify({ workspace })).toString('base64url') + '.sig'
+async function fixture(request?: typeof fetch, overrides?: Partial<HulyDeployment>) {
+  const deployment: HulyDeployment = { workspace: 'a', workspaceUrl: 'pt', origin: 'https://huly.example', endpoint: '', tokenFile: '', botPerson: '', botSocial: '', botAccount: '', channels: ['c'], operators: ['owner'], ...overrides }
   const ticket = { id: 'task', title: 'Investigate', decisionId: 'decision', mandate: { actor: { source: 'huly', id: 'author-social' } },
     channels: [{ source: 'huly', thread: 'a:c:root', address: { workspace: 'a', channelId: 'c', rootId: 'root' } }],
     assignments: [{ id: 'assignment', createdAt: '2026-11-23', startedAt: '2026-11-23', state: 'running' }], inputs: [], undelivered: [], createdAt: '2026-11-23', updatedAt: '2026-11-23', origin: { triggerId: 'root', triggerIds: ['root'] } } as unknown as Ticket
-  const huly = new HulyClient(deployment)
+  const huly = new HulyClient(deployment, request)
   const account = vi.spyOn(huly, 'account').mockResolvedValue({ uuid: 'owner', role: 'USER', socialIds: ['author-social'] })
   const directory = vi.spyOn(huly, 'find').mockResolvedValue([])
   const workspaceMembers = vi.spyOn(huly, 'workspaceMembers').mockResolvedValue([])
@@ -45,12 +48,13 @@ async function fixture() {
   registerTeamPeppy(ctx, runtime, huly)
   const server = createServer((req, res) => { void handler(req, res) }); servers.push(server)
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
-  const token = 'header.' + Buffer.from('{"workspace":"a"}').toString('base64url') + '.sig'
+  const token = workspaceToken(deployment.workspace)
   const headers = { authorization: `Bearer ${token}`, origin: deployment.origin, 'x-team-peppy-request': '1', 'content-type': 'application/json' }
-  const call = (path: string, data?: unknown, overrides = {}) => fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/team-peppy/api/${path}`, {
+  const callPath = (path: string, data?: unknown, overrides = {}) => fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/team-peppy/${path}`, {
     headers: { ...headers, ...overrides }, ...(data ? { method: 'POST', body: JSON.stringify(data) } : {}),
   })
-  return { call, account, directory, workspaceMembers, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages, discussionRoots, triggers }
+  const call = (path: string, data?: unknown, overrides = {}) => callPath(`api/${path}`, data, overrides)
+  return { call, callPath, values, account, directory, workspaceMembers, channel, prompt, cancel, ticket, receive, attach, messageTriggers, disposition, threadMessages, discussionRoots, triggers }
 }
 describe('Huly-authenticated worker bridge', () => {
   it('returns only message-header status and a real session binding after channel authorization', async () => {
@@ -151,6 +155,95 @@ describe('Huly-authenticated worker bridge', () => {
 })
 
 describe('workspace Instances', () => {
+  it('keeps the PT catalog and worker APIs scoped while serving new workspaces through the shared Instances routes', async () => {
+    const pt = '01234567-89ab-4def-8123-456789abcdef'
+    const other = 'abcdef01-2345-4678-9abc-def012345678'
+    const path = `workspaces/${other.toUpperCase()}/api/instances`
+    const auth = { authorization: `Bearer ${workspaceToken(other)}` }
+    const member = { account: 'other-owner', login: 'owner@example.test' }
+    const endpoint = 'https://transactor.example'
+    const accountsEndpoint = 'https://accounts.example/rpc'
+    let workspaceInfo = { uuid: other, url: 'other-workspace' }
+    const request = vi.fn<typeof fetch>(async (url, init) => {
+      if (new Headers(init?.headers).get('authorization') !== auth.authorization) return new Response(null, { status: 401 })
+      if (url === `${endpoint}/api/v1/account/${other}`) {
+        return Response.json({ uuid: member.account, role: 'ADMIN', socialIds: ['other-social'] })
+      }
+      if (String(url).startsWith(`${endpoint}/api/v1/find-all/${other}?`)) {
+        return Response.json([{ personUuid: member.account, name: 'Other Owner' }, { personUuid: 'pt-owner', name: 'PT Owner' }])
+      }
+      if (url === accountsEndpoint) {
+        const method = JSON.parse(String(init?.body)).method
+        if (method === 'getWorkspaceMembers') return Response.json({ result: [{ person: member.account, role: 'ADMIN' }] })
+        if (method === 'getWorkspaceInfo') return Response.json({ result: workspaceInfo })
+      }
+      return new Response(null, { status: 404 })
+    })
+    const f = await fixture(request, { workspace: pt, endpoint, accountsEndpoint })
+    f.account.mockResolvedValue({ uuid: 'pt-owner', role: 'OWNER', socialIds: ['pt-social'] })
+    const ptService = { id: '87654321-ba98-4fed-8123-456789abcdef', protocol: 'https', port: 443 }
+    const ptMachine = { id: '98765432-ba98-4fed-8123-456789abcdef', name: 'PT server', address: '100.71.0.1', services: [ptService] }
+    const ptRegistry = { machines: [ptMachine], grants: [] }
+    f.values.set(`huly-instances:${pt}`, ptRegistry)
+
+    expect((await f.callPath(path)).status).toBe(403)
+    for (const route of ['instances', 'tasks', 'status', 'route-options', 'route', 'message-status', 'conversations/root']) {
+      expect((await f.call(route, undefined, auth)).status).toBe(403)
+    }
+    expect((await f.callPath(`workspaces/${other}/api/tasks`, undefined, auth)).status).toBe(403)
+    expect((await f.callPath(`workspaces/${other}-extra/api/instances`, undefined, auth)).status).toBe(403)
+    expect(request).not.toHaveBeenCalled()
+    expect((await f.callPath(path, undefined, { authorization: auth.authorization + 'invalid' })).status).toBe(401)
+    expect(await (await f.call('instances')).json()).toMatchObject({ admin: true, machines: [ptMachine], grants: [] })
+    expect(await (await f.call(`instances/connection?service=${ptService.id}`)).json()).toEqual({
+      workspaceUrl: 'pt', address: ptMachine.address, port: 443, protocol: 'https', logins: [],
+    })
+    expect(request).toHaveBeenCalledTimes(1)
+
+    const callOther = (op = '', data?: unknown, headers = {}) => f.callPath(path + op, data, { ...auth, ...headers })
+    const empty = await callOther()
+    expect(empty.status).toBe(200)
+    expect(await empty.json()).toEqual({ admin: true, machines: [], grants: [] })
+    const host = { name: 'Other server', address: '100.71.0.1', service: { protocol: 'ssh', port: 22 } }
+    expect((await callOther('/machines', host, { origin: 'https://foreign.test' })).status).toBe(403)
+    expect((await callOther('/machines', host, { 'x-team-peppy-request': '' })).status).toBe(403)
+    expect((await callOther('/machines', host, { 'sec-fetch-site': 'cross-site' })).status).toBe(403)
+    expect((await callOther('/machines', host)).status).toBe(200)
+    const { machines } = await (await callOther()).json()
+    expect(machines).toMatchObject([{ name: host.name, services: [host.service] }])
+    const [{ services: [{ id: serviceId }] }] = machines
+
+    expect(await (await callOther('/targets?scope=team')).json()).toEqual({ targets: [
+      { serviceId, machine: host.name, note: '', ...host.service },
+    ] })
+    const connectionPath = `/connection?service=${serviceId}`
+    expect(await (await callOther(connectionPath)).json()).toEqual({
+      workspaceUrl: 'other-workspace', address: host.address, ...host.service, logins: [],
+    })
+    expect(request).toHaveBeenCalledWith(accountsEndpoint, expect.objectContaining({
+      method: 'POST', headers: expect.objectContaining({ authorization: auth.authorization }),
+      body: JSON.stringify({ method: 'getWorkspaceInfo', params: {} }),
+    }))
+    for (const invalid of [{ uuid: pt, url: 'pt' }, { uuid: other, url: '' }, { uuid: other, url: 'a'.repeat(201) }]) {
+      workspaceInfo = invalid
+      expect((await callOther(connectionPath)).status).toBe(502)
+    }
+    workspaceInfo = { uuid: other, url: 'renamed-workspace' }
+    expect(await (await callOther(connectionPath)).json()).toMatchObject({ workspaceUrl: workspaceInfo.url })
+    expect((await callOther(`/connection?service=${ptService.id}`)).status).toBe(404)
+    expect((await f.call('instances' + connectionPath)).status).toBe(404)
+
+    expect((await callOther('/grants', { serviceId, members: [{ ...member, account: 'pt-owner' }] })).status).toBe(400)
+    const grant = await callOther('/grants', { serviceId, members: [member] })
+    expect(grant.status).toBe(200)
+    const { id: grantId } = await grant.json()
+    expect((await f.call('instances/grant-policy', { grantId })).status).toBe(404)
+    expect(await (await callOther()).json()).toMatchObject({ grants: [{ id: grantId, serviceId, members: [member] }] })
+    expect(await (await f.call('instances')).json()).toMatchObject({ machines: [ptMachine], grants: [] })
+    expect(f.values.get(`huly-instances:${pt}`)).toEqual(ptRegistry)
+    expect(f.values.get(`huly-instances:${other}`)).toMatchObject({ machines: [{ name: host.name }] })
+  })
+
   it('stages the exact services for live Huly members and hides them before application and during revocation', async () => {
     const f = await fixture()
     const identity = (uuid: string, role: string) => f.account.mockResolvedValue({ uuid, role, socialIds: [uuid + '-social'] })
@@ -404,6 +497,51 @@ describe('workspace Instances', () => {
     expect(checked.status).toBe(200)
     expect(await checked.json()).toMatchObject({ reachable: true, checkedAt: expect.any(String) })
     expect(dial).toHaveBeenCalledExactlyOnceWith({ host: host.address, port: 8443, timeout: 3000 })
+  })
+
+  it('shares the probe concurrency limit across workspaces and keeps their checks separate', async () => {
+    const other = randomUUID()
+    const f = await fixture(async () => Response.json({ uuid: 'owner', role: 'OWNER', socialIds: ['other-social'] }))
+    f.account.mockResolvedValue({ uuid: 'owner', role: 'OWNER', socialIds: ['pt-social'] })
+    const ptServices = Array.from({ length: 7 }, (_, i) => ({ id: randomUUID(), protocol: 'http', port: 8000 + i }))
+    const otherServices = [{ ...ptServices[0]!, port: 9000 }, { id: randomUUID(), protocol: 'http', port: 9001 }]
+    const seed = (workspace: string, address: string, services: typeof ptServices) => {
+      f.values.set(`huly-instances:${workspace}`, { machines: [{ id: randomUUID(), name: 'Server', address, services }], grants: [] })
+    }
+    seed('a', '100.71.0.1', ptServices)
+    seed(other, '100.71.0.2', otherServices)
+    const probeOther = (serviceId: string) => f.callPath(`workspaces/${other}/api/instances/probe`, { serviceId }, {
+      authorization: `Bearer ${workspaceToken(other)}`,
+    })
+
+    const sockets: EventEmitter[] = []
+    const dial = vi.mocked(createConnection)
+    dial.mockClear()
+    dial.mockImplementation(() => {
+      const socket = Object.assign(new EventEmitter(), { destroy: vi.fn() })
+      sockets.push(socket)
+      return socket as unknown as Socket
+    })
+    const pending = ptServices.map(({ id }) => f.call('instances/probe', { serviceId: id }))
+    pending.push(probeOther(otherServices[0]!.id))
+    try {
+      await vi.waitFor(() => expect(dial).toHaveBeenCalledTimes(8))
+      expect(dial).toHaveBeenCalledWith({ host: '100.71.0.2', port: 9000, timeout: 3000 })
+      expect((await probeOther(otherServices[1]!.id)).status).toBe(429)
+      expect(dial).toHaveBeenCalledTimes(8)
+      for (const socket of sockets) socket.emit('connect')
+      expect((await Promise.all(pending)).map(response => response.status)).toEqual(Array(8).fill(200))
+
+      const retry = probeOther(otherServices[1]!.id)
+      pending.push(retry)
+      await vi.waitFor(() => expect(dial).toHaveBeenCalledTimes(9))
+      sockets[8]!.emit('connect')
+      expect(await (await retry).json()).toMatchObject({ reachable: true })
+    } finally {
+      for (const socket of sockets) socket.emit('connect')
+      await Promise.allSettled(pending)
+      dial.mockImplementation(connect)
+    }
   })
 
   it('rejects arbitrary addresses, workspace switches, guest access and cross-origin changes', async () => {
